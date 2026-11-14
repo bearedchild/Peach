@@ -10,6 +10,8 @@ const app = document.getElementById('app');
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const TYPES = { chequing: 'Chequing', savings: 'Savings', credit_card: 'Credit card', cash: 'Cash' };
+const GROUP_ORDER = ['chequing', 'savings', 'credit_card', 'cash'];   // accounts sort themselves into these sections
+const GROUP_LABELS = { chequing: 'Chequing', savings: 'Savings', credit_card: 'Credit cards', cash: 'Cash' };
 const KINDS = { expense: 'Expense', savings: 'Savings', rent: 'Rent (funded by rent funding)', chanda: 'Chanda' };
 const BUDGET_LABELS = { communications: 'Communications', fuel: 'Car fuel' };
 const TABLES = ['settings', 'allowance_schedule', 'reimbursement_rules', 'accounts', 'categories', 'budget_plans', 'claims',
@@ -116,6 +118,8 @@ async function reorder(table, siblings, id, dir) {
 function viewAccounts() {
   const active = state.accounts.filter((a) => !a.archived_at);
   const archived = state.accounts.filter((a) => a.archived_at);
+  const bySort = (a, b) => (a.sort_order - b.sort_order) || a.name.localeCompare(b.name);
+  const groups = GROUP_ORDER.map((t) => [t, active.filter((a) => a.type === t).sort(bySort)]).filter(([, l]) => l.length);
   const card = (a, i, list) => {
     const cc = a.type === 'credit_card';
     const bal = cc
@@ -135,8 +139,9 @@ function viewAccounts() {
       </div></div>`;
   };
   return `<div class="wrap"><div class="page-head"><h1>Accounts</h1><button class="primary" data-act="add-account">+ Add account</button></div>
-    <div class="note">Live balances appear once transactions exist (next stage). Never enter full account numbers: the last four digits are optional.</div>
-    ${active.length ? active.map(card).join('') : '<p class="muted">No accounts yet. Add your chequing, savings, cards and cash.</p>'}
+    <div class="note">Accounts group themselves by type. Use ↑ ↓ to put your most-used first within each group. Live balances appear once transactions exist (next stage). Never enter full account numbers: the last four digits are optional.</div>
+    ${groups.length ? groups.map(([t, list]) => `<h2 class="group-h">${GROUP_LABELS[t]} <span class="muted small">(${list.length})</span></h2>${list.map((a, i) => card(a, i, list)).join('')}`).join('')
+      : '<p class="muted">No accounts yet. Add your chequing, savings, cards and cash.</p>'}
     ${archived.length ? `<h2 style="margin:1.25rem 0 .6rem">Archived</h2>${archived.map(card).join('')}` : ''}</div>`;
 }
 
@@ -210,7 +215,7 @@ const VIEWS = { accounts: viewAccounts, categories: viewCategories, settings: vi
 const NAV = [['accounts', 'Accounts', '◉'], ['categories', 'Categories', '❖'], ['settings', 'Settings', '⚙']];
 
 function renderLogin(message = '') {
-  app.innerHTML = `<div class="login"><h1>Budget</h1><p class="muted">Sign in to continue.</p>
+  app.innerHTML = `<div class="login"><h1>Peach</h1><p class="muted">Sign in to continue.</p>
     <form id="login" class="stack">
       <div class="field"><label for="em">Email</label><input id="em" type="email" name="email" autocomplete="username" required></div>
       <div class="field"><label for="pw">Password</label><input id="pw" type="password" name="password" autocomplete="current-password" required></div>
@@ -232,7 +237,7 @@ function render() {
     return;
   }
   const view = VIEWS[state.view] ? state.view : 'accounts';
-  app.innerHTML = `<div class="shell"><nav class="nav" aria-label="Main"><div class="brand">Budget</div>
+  app.innerHTML = `<div class="shell"><nav class="nav" aria-label="Main"><div class="brand">Peach</div>
     ${NAV.map(([k, label, ico]) => `<a href="#${k}" ${k === view ? 'aria-current="page"' : ''}><span class="ico" aria-hidden="true">${ico}</span>${label}</a>`).join('')}</nav>
     <main>${VIEWS[view]()}</main></div>`;
 }
@@ -275,7 +280,9 @@ const handlers = {
     if (!confirm('Archive this account? Its history is kept and you can restore it any time.')) return;
     try { await must(sb.from('accounts').update({ archived_at: new Date().toISOString() }).eq('id', id)); await refresh(); toast('Archived'); } catch (e) { toast(e.message, true); } },
   'restore-account': async ({ id }) => { try { await must(sb.from('accounts').update({ archived_at: null }).eq('id', id)); await refresh(); } catch (e) { toast(e.message, true); } },
-  'move-account': async ({ id, dir }) => { try { await reorder('accounts', state.accounts.filter((a) => !a.archived_at), id, dir); await refresh(); } catch (e) { toast(e.message, true); } },
+  'move-account': async ({ id, dir }) => {
+    const a = byId(state.accounts, id); // reorder only among active accounts of the same type
+    try { await reorder('accounts', state.accounts.filter((x) => !x.archived_at && x.type === a.type), id, dir); await refresh(); } catch (e) { toast(e.message, true); } },
 
   'add-category': ({ parent }) => {
     const tops = state.categories.filter((c) => !c.parent_id && !c.archived_at);

@@ -83,3 +83,5 @@ dialog::backdrop { background: rgba(0,0,0,.6); }
 
 .login { max-width: 380px; margin: 12vh auto 0; padding: 0 16px; }
 .login h1 { color: var(--peach); margin-bottom: .25rem; }
+
+.group-h { margin: 1.25rem 0 .6rem; }
