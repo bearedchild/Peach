@@ -1,639 +1,743 @@
-'use strict';
-/* EverReady — plain JavaScript, no build step.
-   Security note: this file only ever holds the PUBLIC key (config.js).
-   All privacy is enforced by the database's Row Level Security rules. */
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
+import { toCents, fmtCad, sum } from './lib/money.js';
+import { todayLocal, formatRange, calendarMonthOf, monthKey, addMonthsKey, parseDate, nextDueDate } from './lib/dates.js';
+import { DEFAULT_FUNDS, allowanceOn } from './lib/chanda.js';
+import { DEFAULT_RULES, summarizePeriod } from './lib/reimbursement.js';
+import { personalSpendByCategory, reimbursableByLine, categoryStatus, rentEarmark } from './lib/budget.js';
+import { accountBalances } from './lib/accounts.js';
+import { dueReminders, dueLabel, buildCardIcs } from './lib/cards.js';
 
-const CFG = window.EVERREADY_CONFIG;
-const sb = window.supabase.createClient(CFG.url, CFG.key, {
-  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false }
-});
-const $app = document.getElementById('app');
-const YEAR = new Date().getFullYear();
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
+const app = document.getElementById('app');
 
-const S = {
-  user: null, hh: null, admin: false,
-  cats: [], items: [], hi: new Map(), batches: [],
-  all: null, settings: {}, filter: 'all', loaded: false
-};
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const GROUP_ORDER = ['chequing', 'savings', 'credit_card', 'cash'];
+const GROUP_LABELS = { chequing: 'Chequing', savings: 'Savings', credit_card: 'Credit cards', cash: 'Cash' };
+const TYPES = { chequing: 'Chequing', savings: 'Savings', credit_card: 'Credit card', cash: 'Cash' };
+const KINDS = { expense: 'Expense', savings: 'Savings', rent: 'Rent (funded by rent funding)', chanda: 'Chanda' };
+const BUDGET_LABELS = { communications: 'Communications', fuel: 'Car fuel' };
+const INCOME_LABELS = { allowance: 'Allowance', rent_funding: 'Rent funding', reimbursement: 'Reimbursement received', other: 'Other income' };
+const TABLES = ['settings', 'allowance_schedule', 'reimbursement_rules', 'accounts', 'categories', 'budget_plans', 'claims',
+  'transactions', 'transaction_lines', 'recurring_templates', 'chanda_funds', 'chanda_cycle_setup', 'chanda_payments'];
 
-/* ---------- small helpers ---------- */
-const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const $ = (sel, root) => (root || document).querySelector(sel);
+const state = { session: null, view: 'home', month: null, accounts: [], categories: [], settings: null, allowance: [], rules: [],
+  txns: [], lines: [], loadError: null };
+
+// ---------- helpers ----------
+const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch { /* storage unavailable: fine */ } };
 let toastTimer;
-function toast(msg) {
+function toast(msg, isError = false) {
   const t = document.getElementById('toast');
-  t.textContent = msg; t.classList.add('show');
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+  t.textContent = msg;
+  t.className = `show${isError ? ' error' : ''}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ''; }, isError ? 5000 : 2500);
 }
-function friendly(err) {
-  const m = (err && err.message) || String(err || '');
-  if (/invalid login/i.test(m)) return 'That email and password do not match. Please try again.';
-  if (/already registered|already been registered/i.test(m)) return 'That email already has an account. Try logging in instead.';
-  if (/database error saving new user|valid invite/i.test(m)) return 'This invite link is not valid any more. Ask for a new one.';
-  if (/password/i.test(m) && /6|8|short|weak/i.test(m)) return 'Please choose a password with at least 8 characters.';
-  if (/rate limit|too many/i.test(m)) return 'Too many attempts. Please wait a minute and try again.';
-  if (/email.*confirm|not confirmed/i.test(m)) return 'Email confirmation is still switched on in Supabase. See the setup guide.';
-  return m || 'Something went wrong. Please try again.';
+async function must(q) {
+  const { data, error } = await q;
+  if (error) throw new Error(error.message);
+  return data;
 }
-const icon = {
-  home: '<svg viewBox="0 0 26 26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12.5L13 4l10 8.5"/><path d="M6 11v10h14V11"/></svg>',
-  user: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c1-4 4-6 8-6s7 2 8 6"/></svg>',
-  shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>',
-  back: '<svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3L5 8l5 5"/></svg>',
-  check: '<svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 10.5l4 4 8-9"/></svg>',
-  chev: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3l5 5-5 5"/></svg>'
-};
-// Notes are escaped first, so only our own <strong> tag can ever appear.
-function noteHtml(text) {
-  return esc(text).replace(/^Guide:/, '<strong class="guide-word">Guide:</strong>');
-}
-function pctText(x) { return Math.round(x * 100) + '%'; }
-function relDay(ts) {
-  if (!ts) return 'Never';
-  const d = Math.floor((Date.now() - new Date(ts).getTime()) / 86400000);
-  if (d <= 0) return 'Today';
-  if (d === 1) return 'Yesterday';
-  if (d < 14) return d + ' days ago';
-  if (d < 60) return Math.floor(d / 7) + ' weeks ago';
-  return Math.floor(d / 30) + ' months ago';
+const centsToInput = (c) => `${c < 0 ? '-' : ''}${Math.floor(Math.abs(c) / 100)}.${String(Math.abs(c) % 100).padStart(2, '0')}`;
+const nextSort = (rows) => (rows.reduce((m, r) => Math.max(m, r.sort_order ?? 0), 0) || 0) + 10;
+const bySort = (a, b) => ((a.sort_order ?? 0) - (b.sort_order ?? 0)) || String(a.name).localeCompare(String(b.name));
+const byId = (list, id) => list.find((x) => x.id === id);
+const activeAccounts = () => state.accounts.filter((a) => !a.archived_at);
+const ordinal = (n) => `${n}${[, 'st', 'nd', 'rd'][(n % 100 > 10 && n % 100 < 14) ? 0 : n % 10] || 'th'}`;
+function checkDate(s) { parseDate(s); return s; }
+function positiveCents(input, label) {
+  const c = toCents(input || '0');
+  if (c <= 0) throw new Error(`${label} must be more than $0.00`);
+  return c;
 }
 
-/* ---------- status maths (shared by user + admin views) ---------- */
-function itemScore(it, row) {
-  if (it.recommended_weeks) return Math.min((row && row.weeks_stocked) || 0, it.recommended_weeks) / it.recommended_weeks;
-  return row && row.done ? 1 : 0;
-}
-function itemState(it, row) {
-  const s = itemScore(it, row);
-  if (s >= 1) return 'complete';
-  if (s > 0) return 'low';
-  return 'empty';
-}
-function batchStatus(b) {
-  if (b.used) return { key: 'used', label: 'Used', cls: '' };
-  if (b.expiry_year == null) return { key: 'ok', label: 'No expiry set', cls: '' };
-  if (b.expiry_year < YEAR) return { key: 'expired', label: 'Expired', cls: 'bad' };
-  if (b.expiry_year === YEAR) return { key: 'soon', label: 'Expires this year', cls: 'warn' };
-  return { key: 'ok', label: 'Good', cls: 'home' };
-}
-function summarize(items, rowsByItem, batches) {
-  let sum = 0, low = 0;
-  items.forEach((it) => {
-    const r = rowsByItem.get(it.id);
-    sum += itemScore(it, r);
-    if (itemState(it, r) === 'low') low++;
+function openForm({ title, intro = '', body, submitLabel = 'Save', onSubmit, onOpen }) {
+  const dlg = document.createElement('dialog');
+  dlg.innerHTML = `<form method="dialog" class="stack"><h2>${esc(title)}</h2>${intro ? `<p class="small muted" style="margin:0">${intro}</p>` : ''}${body}
+    <div class="err" role="alert"></div>
+    <div class="row"><button type="button" data-cancel>Cancel</button><button class="primary" type="submit">${esc(submitLabel)}</button></div></form>`;
+  document.body.appendChild(dlg);
+  const form = dlg.querySelector('form');
+  const err = dlg.querySelector('.err');
+  dlg.querySelector('[data-cancel]').onclick = () => dlg.close();
+  dlg.addEventListener('close', () => dlg.remove());
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    err.textContent = '';
+    const btn = form.querySelector('.primary');
+    btn.disabled = true;
+    try { await onSubmit(Object.fromEntries(new FormData(form)), form); dlg.close(); }
+    catch (ex) { err.textContent = ex.message || String(ex); btn.disabled = false; }
   });
-  const expiring = batches.filter((b) => { const k = batchStatus(b).key; return k === 'expired' || k === 'soon'; }).length;
-  return { ready: items.length ? sum / items.length : 0, low, expiring };
-}
-function tagsFor(it) {
-  const t = [];
-  if (it.is_optional) t.push('<span class="pill">Optional</span>');
-  if (it.at_home) t.push('<span class="pill home">At home</span>');
-  if (it.portable === 'small') t.push('<span class="pill kit">Small amount in kit</span>');
-  if (it.portable === 'full') t.push('<span class="pill kit">Portable kit</span>');
-  return t.join(' ');
-}
-function waterGoal(it) {
-  if (!it.liters_per_person_per_day || !it.recommended_weeks || !S.hh) return '';
-  const total = it.liters_per_person_per_day * S.hh.people * 7 * it.recommended_weeks;
-  return 'Goal for ' + S.hh.people + (S.hh.people === 1 ? ' person' : ' people') + ': ' + total + ' L (' + it.liters_per_person_per_day + ' L per person per day for ' + it.recommended_weeks + ' weeks)';
+  dlg.showModal();
+  onOpen?.(dlg);
 }
 
-function trimNum(n) { return String(Math.round(n * 10) / 10); }
-function fmtGrams(g) { return (Math.round(g / 10) * 10).toLocaleString('en-US') + ' g'; }
-// Estimated volume from weight, using a typical density for the food (g per ml).
-function fmtVolume(ml) {
-  if (ml >= 1000) return { n: trimNum(ml / 1000), u: 'L' };
-  return { n: String(Math.round(ml / 10) * 10), u: 'ml' };
-}
-// One line for the household's own size, worked out from the per-person amount.
-function householdAmount(it) {
-  if (!it.per_person_min || !S.hh) return '';
-  const lo = it.per_person_min * S.hh.people;
-  const hi = (it.per_person_max || it.per_person_min) * S.hh.people;
-  const grams = lo === hi ? fmtGrams(lo) : fmtGrams(lo).replace(' g', '') + ' to ' + fmtGrams(hi);
-  let vol = '';
-  if (it.per_person_density) {
-    const a = fmtVolume(lo / it.per_person_density), b = fmtVolume(hi / it.per_person_density);
-    if (lo === hi) vol = a.n + ' ' + a.u;
-    else if (a.u === b.u) vol = a.n + ' to ' + b.n + ' ' + a.u;
-    else vol = a.n + ' ' + a.u + ' to ' + b.n + ' ' + b.u;
-  }
-  return 'For your household of ' + S.hh.people + ': about ' + grams + (vol ? ' (about ' + vol + ')' : '');
-}
-
-/* ---------- data loading ---------- */
+// ---------- data ----------
 async function loadAll() {
-  const uid = S.user.id;
-  const [c, i, h, a, st] = await Promise.all([
-    sb.from('categories').select('*').eq('active', true).order('sort_order'),
-    sb.from('items').select('*').eq('active', true).order('sort_order'),
-    sb.from('households').select('*').eq('owner_id', uid).maybeSingle(),
-    sb.from('admins').select('user_id').eq('user_id', uid).maybeSingle(),
-    sb.from('app_settings').select('*')
+  const [accounts, categories, settings, allowance, rules, txns, lines] = await Promise.all([
+    must(sb.from('accounts').select('*').order('sort_order').order('name')),
+    must(sb.from('categories').select('*').order('sort_order').order('name')),
+    must(sb.from('settings').select('*').maybeSingle()),
+    must(sb.from('allowance_schedule').select('*').order('effective_from', { ascending: false })),
+    must(sb.from('reimbursement_rules').select('*').order('effective_from', { ascending: false })),
+    must(sb.from('transactions').select('*').order('date', { ascending: false }).order('created_at', { ascending: false })),
+    must(sb.from('transaction_lines').select('*')),
   ]);
-  if (c.error) throw c.error; if (i.error) throw i.error; if (h.error) throw h.error;
-  S.cats = c.data; S.items = i.data; S.hh = h.data; S.admin = !!a.data;
-  S.settings = {}; (st.data || []).forEach((r) => { S.settings[r.key] = r.value; });
-  if (!S.hh) throw new Error('Your household record is missing. Please contact the administrator.');
-  const [hi, bt] = await Promise.all([
-    sb.from('household_items').select('*').eq('household_id', S.hh.id),
-    sb.from('purchase_batches').select('*').eq('household_id', S.hh.id).order('expiry_year', { nullsFirst: false }).order('purchase_year')
-  ]);
-  if (hi.error) throw hi.error; if (bt.error) throw bt.error;
-  S.hi = new Map(hi.data.map((r) => [r.item_id, r]));
-  S.batches = bt.data;
-  S.loaded = true;
-  sb.from('households').update({ last_active_at: new Date().toISOString() }).eq('id', S.hh.id).then(() => {});
-}
-async function loadAdminData() {
-  const [h, hi, bt, it, ct] = await Promise.all([
-    sb.from('households').select('*').order('created_at'),
-    sb.from('household_items').select('*'),
-    sb.from('purchase_batches').select('*'),
-    sb.from('items').select('*').order('sort_order'),
-    sb.from('categories').select('*').order('sort_order')
-  ]);
-  for (const r of [h, hi, bt, it, ct]) if (r.error) throw r.error;
-  const rows = new Map(); hi.data.forEach((r) => { if (!rows.has(r.household_id)) rows.set(r.household_id, new Map()); rows.get(r.household_id).set(r.item_id, r); });
-  const bat = new Map(); bt.data.forEach((b) => { if (!bat.has(b.household_id)) bat.set(b.household_id, []); bat.get(b.household_id).push(b); });
-  S.all = { households: h.data, rows, bat, items: it.data, cats: ct.data };
+  Object.assign(state, { accounts, categories, settings, allowance, rules, txns, lines, loadError: null });
 }
 
-/* ---------- layout pieces ---------- */
-function shell(inner, tab, wide) {
-  const tabs = '<nav class="tabbar" aria-label="Main">' +
-    '<a href="#/" class="' + (tab === 'home' ? 'on' : '') + '">' + icon.home + 'Home</a>' +
-    (S.admin ? '<a href="#/admin" class="' + (tab === 'admin' ? 'on' : '') + '">' + icon.shield + 'Admin</a>' : '') +
-    '<a href="#/account" class="' + (tab === 'account' ? 'on' : '') + '">' + icon.user + 'Account</a></nav>';
-  const initials = (S.hh ? S.hh.name : 'EV').split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase();
-  return '<div class="wrap' + (wide ? ' wide' : '') + '"><header class="top"><a class="brand" href="#/"><img src="logo.png" alt="">EverReady</a>' +
-    '<a class="avatar" href="#/account" aria-label="Account">' + esc(initials) + '</a></header>' + inner + '</div>' + tabs;
-}
-function bar(p, thick) { return '<div class="bar' + (thick ? ' thick' : '') + '"><i style="width:' + Math.round(p * 100) + '%"></i></div>'; }
-function weekBoxes(it, row, interactive) {
-  const n = (row && row.weeks_stocked) || 0;
-  let h = '<div class="weeks">';
-  for (let i = 1; i <= it.recommended_weeks; i++) {
-    const on = i <= n;
-    h += interactive
-      ? '<button type="button" class="wk' + (on ? ' on' : '') + '" data-action="week" data-item="' + it.id + '" data-n="' + i + '" aria-pressed="' + on + '" aria-label="' + esc(it.name) + ', week ' + i + '">' + (on ? icon.check : i) + '</button>'
-      : '<span class="wk static' + (on ? ' on' : '') + '">' + (on ? icon.check : i) + '</span>';
+// First-run defaults. Each table is seeded only if it is empty, so this is safe to retry.
+async function ensureSeed() {
+  let changed = false;
+  if (!state.settings) { await must(sb.from('settings').insert({})); changed = true; }
+  if (!state.categories.length) {
+    const top = ['Groceries', 'Eating out', 'Phone', 'Internet', 'Subscriptions', 'Entertainment', 'Car fuel', 'Rent', 'Chanda', 'General savings', 'Other'];
+    const kinds = { Rent: 'rent', Chanda: 'chanda', 'General savings': 'savings' };
+    const parents = await must(sb.from('categories').insert(top.map((name, i) => ({ name, kind: kinds[name] ?? 'expense', sort_order: (i + 1) * 10 }))).select());
+    const chandaId = parents.find((p) => p.name === 'Chanda').id;
+    await must(sb.from('categories').insert(DEFAULT_FUNDS.map((f, i) => ({ name: f.name, parent_id: chandaId, kind: 'chanda', sort_order: (i + 1) * 10 }))));
+    changed = true;
   }
-  return h + '</div>';
-}
-function doneButton(it, row) {
-  const on = !!(row && row.done);
-  return '<button type="button" class="done' + (on ? ' on' : '') + '" data-action="done" data-item="' + it.id + '" aria-pressed="' + on + '"><span class="box">' + (on ? icon.check : '') + '</span>' + (on ? 'Done' : 'Mark as done') + '</button>';
-}
-function kitButton(it, row) {
-  if (it.portable === 'none' || !it.at_home) return '';
-  const on = !!(row && row.portable_done);
-  return '<button type="button" class="done' + (on ? ' on' : '') + '" data-action="kit" data-item="' + it.id + '" aria-pressed="' + on + '"><span class="box">' + (on ? icon.check : '') + '</span>' + (it.portable === 'small' ? 'Small amount also in portable kit' : 'Also in portable kit') + '</button>';
-}
-function itemCard(it) {
-  const row = S.hi.get(it.id);
-  const weeks = it.recommended_weeks ? Math.min((row && row.weeks_stocked) || 0, it.recommended_weeks) : 0;
-  let body;
-  if (it.recommended_weeks) {
-    body = weekBoxes(it, row, true) + '<div class="sub"><b style="color:var(--dark)">' + weeks + ' of ' + it.recommended_weeks + ' weeks stocked</b></div>';
-  } else {
-    body = doneButton(it, row);
+  if (!state.rules.length) {
+    await must(sb.from('reimbursement_rules').insert(Object.entries(DEFAULT_RULES.budgets).map(([k, b]) => ({ budget_key: k, cap_cents: b.capCents, effective_from: '2026-12-01' }))));
+    changed = true;
   }
-  const extra = [];
-  if (it.target_quantity) extra.push('Target: ' + esc(it.target_quantity));
-  const wg = waterGoal(it); if (wg) extra.push(esc(wg));
-  const ha = householdAmount(it); if (ha) extra.push('<b style="color:var(--dark)">' + esc(ha) + '</b>');
-  return '<div class="card stack"><div class="between"><span class="item-name">' + esc(it.name) + '</span>' +
-    '<a class="link" href="#/item/' + it.id + '">Details</a></div><div class="row">' + tagsFor(it) + '</div>' + body +
-    (extra.length ? '<div class="sub">' + extra.join('<br>') + '</div>' : '') + kitButton(it, row) + '</div>';
-}
-
-/* ---------- views ---------- */
-function viewAuth(mode) {
-  const invite = sessionStorage.getItem('er_invite') || '';
-  const signup = mode === 'signup' && invite;
-  let h = '<div class="auth"><a class="brand" href="#/"><img src="logo.png" alt="">EverReady</a>';
-  if (signup) {
-    h += '<div class="stack"><h1>Create your household account</h1><p class="sub">You have been invited. This takes about a minute.</p></div>' +
-      '<div id="msg"></div><form id="signup" class="stack" style="gap:18px" novalidate>' +
-      '<div class="field"><label for="hn">Household name</label><input id="hn" type="text" maxlength="80" placeholder="For example, Oakridge Household" autocomplete="off" required></div>' +
-      '<div class="field"><span style="font-weight:600;margin-bottom:6px">People in your household</span><div class="stepper"><button type="button" data-action="people" data-d="-1" aria-label="One fewer person">&minus;</button><b id="pc">1</b><button type="button" data-action="people" data-d="1" aria-label="One more person">+</button></div><span class="hint">Used to work out how much water you need.</span></div>' +
-      '<div class="field"><label for="em">Email</label><input id="em" type="email" autocomplete="email" placeholder="you@example.com" required></div>' +
-      '<div class="field"><label for="pw">Password</label><input id="pw" type="password" autocomplete="new-password" placeholder="At least 8 characters" required></div>' +
-      '<button class="btn block" type="submit">Create account</button></form>' +
-      '<p class="hint" style="text-align:center">Already have an account? <a href="#/login">Log in</a></p>' +
-      '<p class="hint" style="text-align:center">By continuing you agree to the <a href="#/terms">Terms</a> and <a href="#/privacy">Privacy Policy</a>.</p>';
-  } else {
-    h += '<div class="stack"><h1>Welcome back</h1><p class="sub">Log in to see your household\'s supplies.</p></div>' +
-      '<div id="msg"></div><form id="login" class="stack" style="gap:18px" novalidate>' +
-      '<div class="field"><label for="em">Email</label><input id="em" type="email" autocomplete="email" required></div>' +
-      '<div class="field"><label for="pw">Password</label><input id="pw" type="password" autocomplete="current-password" required></div>' +
-      '<button class="btn block" type="submit">Log in</button></form>' +
-      (invite ? '<p class="hint" style="text-align:center">New here? <a href="#/signup">Create your household account</a></p>'
-        : '<p class="hint" style="text-align:center">Need an account? Ask for an invite link.</p>') +
-      '<p class="hint" style="text-align:center">Forgot your password? Ask the administrator to reset it for you.</p>';
+  if (!state.allowance.length) {
+    await must(sb.from('allowance_schedule').insert({ effective_from: '2026-12-01', amount_cents: 60000 }));
+    changed = true;
   }
-  return h + '</div>';
+  const funds = await must(sb.from('chanda_funds').select('id').limit(1));
+  if (!funds.length) {
+    await must(sb.from('chanda_funds').insert(DEFAULT_FUNDS.map((f, i) => ({
+      name: f.name, kind: f.kind, percent_bps: f.percentBps ?? null, annual_cents: f.annualCents ?? null,
+      cycle_start_month: f.cycleStartMonth, sort_order: (i + 1) * 10 }))));
+    changed = true;
+  }
+  if (changed) await loadAll();
 }
 
-function viewDashboard() {
-  const sm = summarize(S.items, S.hi, S.batches);
-  const C = 2 * Math.PI * 54;
-  const ring = '<svg width="132" height="132" viewBox="0 0 132 132" role="img" aria-label="Overall readiness ' + pctText(sm.ready) + '"><circle cx="66" cy="66" r="54" fill="none" stroke="#E8E2D6" stroke-width="12"/><circle cx="66" cy="66" r="54" fill="none" stroke="#2F6B4F" stroke-width="12" stroke-linecap="round" stroke-dasharray="' + (C * sm.ready).toFixed(1) + ' ' + C.toFixed(1) + '" transform="rotate(-90 66 66)"/><text x="66" y="75" text-anchor="middle" font-size="30" font-family="Fraunces,Georgia,serif" font-weight="700" fill="#1F2A24">' + pctText(sm.ready) + '</text></svg>';
-  const itemById = new Map(S.items.map((x) => [x.id, x]));
-  const att = [];
-  S.batches.forEach((b) => {
-    const st = batchStatus(b); const it = itemById.get(b.item_id);
-    if (it && (st.key === 'expired' || st.key === 'soon')) att.push({ id: it.id, name: it.name + ' — ' + b.purchase_year + ' batch', detail: 'Estimated expiry ' + b.expiry_year, tag: st.label, cls: st.cls, w: st.key === 'expired' ? 0 : 1 });
-  });
-  S.items.forEach((it) => {
-    const r = S.hi.get(it.id);
-    if (itemState(it, r) === 'low') att.push({ id: it.id, name: it.name, detail: ((r && r.weeks_stocked) || 0) + ' of ' + it.recommended_weeks + ' weeks stocked', tag: 'Low', cls: 'bad', w: 2 });
-  });
-  att.sort((a, b) => a.w - b.w);
-  const attHtml = att.length
-    ? att.slice(0, 8).map((a) => '<a class="card between" style="text-decoration:none;color:inherit" href="#/item/' + a.id + '"><div><div class="item-name" style="font-size:16px">' + esc(a.name) + '</div><div class="sub" style="font-size:14px">' + esc(a.detail) + '</div></div><span class="pill ' + a.cls + '">' + esc(a.tag) + '</span></a>').join('') + (att.length > 8 ? '<p class="hint">and ' + (att.length - 8) + ' more</p>' : '')
-    : '<div class="card sub">Nothing needs attention right now.</div>';
-  const cats = S.cats.map((c) => {
-    const its = S.items.filter((i) => i.category_id === c.id);
-    const s = summarize(its, S.hi, []);
-    const todo = its.filter((i) => itemState(i, S.hi.get(i.id)) !== 'complete').length;
-    return '<a class="card cat-link" href="#/cat/' + c.id + '"><div class="between"><span class="item-name" style="font-size:16px">' + esc(c.name) + '</span><span style="display:flex;align-items:center;gap:6px;font-weight:700;color:var(--dark)">' + pctText(s.ready) + icon.chev + '</span></div>' + bar(s.ready) + '<span class="hint">' + (todo ? todo + (todo === 1 ? ' item' : ' items') + ' to stock' : 'All done') + '</span></a>';
-  }).join('');
-  return shell('<div class="stack" style="gap:2px"><h1>' + esc(S.hh.name) + '</h1><span class="sub">' + S.hh.people + (S.hh.people === 1 ? ' person' : ' people') + '</span></div>' +
-    '<section class="card big stack" style="gap:18px"><div class="hero">' + ring + '<div class="stack" style="gap:6px"><span class="eyebrow">Overall readiness</span><span style="font-family:Fraunces,Georgia,serif;font-size:22px;font-weight:700;line-height:1.2">' + (sm.ready >= 1 ? 'Fully stocked. Well done.' : sm.ready >= 0.5 ? 'A solid start. Keep going.' : 'Every week you add counts.') + '</span></div></div>' +
-    '<div class="row">' + (sm.low ? '<span class="pill bad" style="font-size:14px;padding:8px 14px">' + sm.low + ' low on stock</span>' : '') + (sm.expiring ? '<span class="pill warn" style="font-size:14px;padding:8px 14px">' + sm.expiring + ' expiring or expired</span>' : '') + '</div></section>' +
-    '<section class="stack"><h2>Needs attention</h2>' + attHtml + '</section>' +
-    '<section class="stack"><h2>Your supplies</h2>' + cats + '</section>', 'home');
+async function refresh() {
+  try { await loadAll(); await ensureSeed(); } catch (e) { state.loadError = e.message; }
+  render();
 }
 
-function viewCategory(id) {
-  const c = S.cats.find((x) => x.id === id); if (!c) return notFound();
-  const its = S.items.filter((i) => i.category_id === id);
-  const s = summarize(its, S.hi, []);
-  const f = S.filter;
-  const shown = its.filter((i) => { const st = itemState(i, S.hi.get(i.id)); return f === 'all' || (f === 'todo' && st !== 'complete') || (f === 'done' && st === 'complete'); });
-  let body = '', lastGroup = '__none__';
-  shown.forEach((it) => {
-    const g = it.group_title || '';
-    if (g !== lastGroup) { if (g) body += '<h3 class="group">' + esc(g) + '</h3>'; lastGroup = g; }
-    body += itemCard(it);
-  });
-  if (!shown.length) body = '<div class="card sub">Nothing to show here.</div>';
-  return shell('<div class="stack"><a class="back" href="#/">' + icon.back + 'Home</a><div class="between" style="align-items:flex-end"><h1>' + esc(c.name) + '</h1><span style="font-family:Fraunces,Georgia,serif;font-size:26px;font-weight:700;color:var(--dark)">' + pctText(s.ready) + '</span></div>' + (c.label ? '<span class="hint">' + esc(c.label) + '</span>' : '') + bar(s.ready, true) + '</div>' +
-    '<div class="row"><button class="chip' + (f === 'all' ? ' on' : '') + '" data-action="filter" data-f="all">All</button><button class="chip' + (f === 'todo' ? ' on' : '') + '" data-action="filter" data-f="todo">Needs stocking</button><button class="chip' + (f === 'done' ? ' on' : '') + '" data-action="filter" data-f="done">Complete</button></div>' + body, 'home');
+async function reorder(table, siblings, id, dir) {
+  const list = [...siblings].sort(bySort);
+  const i = list.findIndex((x) => x.id === id);
+  const j = dir === 'up' ? i - 1 : i + 1;
+  if (i < 0 || j < 0 || j >= list.length) return;
+  [list[i], list[j]] = [list[j], list[i]];
+  await Promise.all(list.map((x, k) => must(sb.from(table).update({ sort_order: (k + 1) * 10 }).eq('id', x.id))));
 }
 
-function batchesHtml(it, hhId, readonly) {
-  const list = (readonly ? readonly : S.batches).filter((b) => b.item_id === it.id);
-  const firstId = (list.filter((b) => !b.used && b.expiry_year != null).sort((a, b) => a.expiry_year - b.expiry_year)[0] || {}).id;
-  if (!list.length) return '<div class="card sub">No purchases recorded yet.</div>';
-  return list.slice().sort((a, b) => (a.expiry_year == null) - (b.expiry_year == null) || (a.expiry_year || 0) - (b.expiry_year || 0) || a.purchase_year - b.purchase_year).map((b) => {
-    const st = batchStatus(b);
-    return '<div class="card stack"><div class="between"><span class="item-name">' + esc(it.name) + ' — ' + b.purchase_year + '</span><span class="sub" style="font-weight:600">' + esc(b.quantity || '') + '</span></div>' +
-      '<div class="row">' + (b.id === firstId ? '<span class="pill first">Use first</span>' : '') + '<span class="pill ' + st.cls + '">' + esc(st.label) + '</span></div>' +
-      '<div class="between sub" style="font-size:14px"><span>' + (b.shelf_life_years ? 'Shelf life ' + b.shelf_life_years + ' years' : 'No shelf life set') + '</span><span>' + (b.expiry_year ? 'Estimated expiry ' + b.expiry_year : '') + '</span></div>' +
-      (b.exact_date ? '<div class="hint">Purchased ' + esc(b.exact_date) + '</div>' : '') + (b.note ? '<div class="sub" style="font-size:14px">' + esc(b.note) + '</div>' : '') +
-      (readonly ? '' : '<div class="row"><button class="btn line small" data-action="batch-used" data-id="' + b.id + '">' + (b.used ? 'Mark as not used' : 'Mark this batch as used') + '</button><button class="link" data-action="batch-del" data-id="' + b.id + '">Delete</button></div>') + '</div>';
-  }).join('');
+// ---------- derived numbers (all from the tested logic modules) ----------
+function rulesFromState(today) {
+  const s = state.settings ?? {};
+  const cap = (k) => (state.rules.filter((r) => r.budget_key === k && r.effective_from <= today).sort((a, b) => b.effective_from.localeCompare(a.effective_from))[0]?.cap_cents
+    ?? DEFAULT_RULES.budgets[k].capCents);
+  return { startDay: s.period_start_day ?? 21, payDay: s.reimbursement_pay_day ?? 1, carryOverUnused: !!s.carry_over_unused,
+    budgets: { communications: { label: 'Communications', capCents: cap('communications') }, fuel: { label: 'Car fuel', capCents: cap('fuel') } } };
+}
+function expenseLines() {
+  const txById = new Map(state.txns.map((t) => [t.id, t]));
+  return state.lines.filter((l) => txById.get(l.transaction_id)?.kind === 'expense').map((l) => ({
+    id: l.id, txnId: l.transaction_id, date: txById.get(l.transaction_id).date, amountCents: l.amount_cents, categoryId: l.category_id,
+    budget: l.reimb_budget ?? undefined, eligible: !!l.reimb_eligible,
+    exception: l.work_trip_exception ? { approved: true, reimbursableCents: l.exception_reimbursable_cents ?? 0, note: l.exception_note } : undefined,
+  }));
+}
+const mapAccounts = () => state.accounts.map((a) => ({ id: a.id, name: a.name, type: a.type, openingBalanceCents: a.opening_balance_cents,
+  archivedAt: a.archived_at, dueDay: a.due_day, minPaymentCents: a.min_payment_cents, remindDays: a.remind_days }));
+const mapTxns = () => state.txns.map((t) => ({ id: t.id, accountId: t.account_id, date: t.date, amountCents: t.amount_cents, kind: t.kind,
+  transferGroupId: t.transfer_group_id, incomeSource: t.income_source }));
+
+function computeHome(today = todayLocal()) {
+  const month = calendarMonthOf(today);
+  const rules = rulesFromState(today);
+  const lines = expenseLines();
+  const rentIds = state.categories.filter((c) => c.kind === 'rent').map((c) => c.id);
+  const spend = personalSpendByCategory(lines, month.key, rules, { earmarkedCategoryIds: rentIds });
+  const inMonth = state.txns.filter((t) => monthKey(t.date) === month.key);
+  const allowanceCents = sum(inMonth.filter((t) => t.kind === 'income' && t.income_source === 'allowance').map((t) => t.amount_cents));
+  const leftCents = allowanceCents - spend.totalPersonalCents;
+
+  const cur = summarizePeriod(lines, today, rules);
+  const dayBefore = (() => { const { y, m, d } = parseDate(cur.period.start); const t = new Date(Date.UTC(y, m - 1, d - 1)); return t.toISOString().slice(0, 10); })();
+  const prev = summarizePeriod(lines, dayBefore, rules);
+  const awaiting = [];
+  if (prev.totalReimbursableCents > 0 && prev.expectedReimbursementDate > today) awaiting.push(prev);
+  if (cur.totalReimbursableCents > 0) awaiting.push(cur);
+
+  const fundingReceived = sum(state.txns.filter((t) => t.kind === 'income' && t.income_source === 'rent_funding').map((t) => t.amount_cents));
+  const rentCharged = sum(lines.filter((l) => rentIds.includes(l.categoryId)).map((l) => l.amountCents));
+  const settled = sum(state.txns.filter((t) => t.kind === 'transfer' && t.is_rent_settlement && t.amount_cents > 0).map((t) => t.amount_cents));
+  const rent = rentEarmark({ fundingReceivedCents: fundingReceived, rentChargedToCardCents: rentCharged, settledCents: settled });
+
+  const balances = accountBalances(mapAccounts(), mapTxns());
+  const reminders = dueReminders(mapAccounts(), mapTxns(), today);
+  return { today, month, spend, allowanceCents, leftCents, awaiting, rent, fundingReceived, balances, reminders, rules };
 }
 
-function viewItem(id) {
-  const it = S.items.find((x) => x.id === id); if (!it) return notFound();
-  const row = S.hi.get(id);
-  const cat = S.cats.find((c) => c.id === it.category_id);
-  const weeks = it.recommended_weeks ? Math.min((row && row.weeks_stocked) || 0, it.recommended_weeks) : 0;
-  const wg = waterGoal(it);
-  return shell('<div class="stack"><a class="back" href="#/cat/' + it.category_id + '">' + icon.back + esc(cat ? cat.name : 'Back') + '</a><h1 style="font-size:32px">' + esc(it.name) + '</h1>' + (it.group_title ? '<span class="hint">' + esc(it.group_title) + '</span>' : '') + '<div class="row">' + tagsFor(it) + '</div></div>' +
-    ((it.notes || householdAmount(it)) ? '<div class="card sub note">' + (it.notes ? noteHtml(it.notes) : '') + (householdAmount(it) ? '<div class="household-line">' + esc(householdAmount(it)) + '</div>' : '') + '</div>' : '') +
-    '<section class="card big stack">' + (it.recommended_weeks
-      ? '<div class="between"><h3>Weeks stocked</h3><span style="font-family:Fraunces,Georgia,serif;font-size:22px;font-weight:700;color:var(--dark)">' + weeks + ' of ' + it.recommended_weeks + '</span></div>' + weekBoxes(it, row, true)
-      : '<h3>Stocked?</h3>' + doneButton(it, row)) +
-    (it.target_quantity ? '<div class="sub">Target: ' + esc(it.target_quantity) + '</div>' : '') + (wg ? '<div class="sub">' + esc(wg) + '</div>' : '') + kitButton(it, row) + '</section>' +
-    '<section class="stack"><label for="nt" style="margin:0;color:var(--muted);font-size:15px">Your storage notes</label><textarea id="nt" data-item="' + id + '" maxlength="500" placeholder="Where it is stored, brand, anything to remember">' + esc((row && row.notes) || '') + '</textarea></section>' +
-    '<section class="stack"><div class="between"><h2>Purchases</h2><span class="hint">Oldest expiry first</span></div>' + batchesHtml(it) + '</section>' +
-    '<section class="card big stack" style="border:2px solid var(--green)"><h3>Add a purchase</h3><form id="addbatch" class="stack" data-item="' + id + '" novalidate>' +
-    '<div class="row" style="flex-wrap:nowrap"><div class="field" style="flex:1"><label for="py">Year</label><input id="py" type="number" inputmode="numeric" value="' + YEAR + '" min="1980" max="2200"></div><div class="field" style="flex:1"><label for="pq">Quantity</label><input id="pq" type="text" maxlength="40" placeholder="10 kg"></div></div>' +
-    '<div class="field"><label for="ps">Shelf life in years (optional)</label><input id="ps" type="number" inputmode="numeric" min="1" max="100" value="' + (it.default_shelf_life_years || '') + '" placeholder="For example, 10"></div>' +
-    '<div class="field"><label for="pd">Exact date (optional)</label><input id="pd" type="text" placeholder="2026-11-14" maxlength="10"></div>' +
-    '<div class="field"><label for="pn">Note (optional)</label><input id="pn" type="text" maxlength="200"></div>' +
-    '<button class="btn block" type="submit">Save purchase</button></form></section>', 'home');
+// ---------- views ----------
+function stat(label, value, caption, extra = '') {
+  return `<div class="stat"><div class="stat-label">${label}</div><div class="stat-value">${value}</div><div class="small muted">${caption}</div>${extra}</div>`;
 }
 
-function viewAccount() {
-  return shell('<h1>Account</h1><div id="msg"></div>' +
-    '<form id="acct" class="card big stack" novalidate><h3>Household</h3><div class="field"><label for="an">Household name</label><input id="an" type="text" maxlength="80" value="' + esc(S.hh.name) + '"></div>' +
-    '<div class="field"><span style="font-weight:600;margin-bottom:6px">People in your household</span><div class="stepper"><button type="button" data-action="people" data-d="-1" aria-label="One fewer person">&minus;</button><b id="pc">' + S.hh.people + '</b><button type="button" data-action="people" data-d="1" aria-label="One more person">+</button></div></div>' +
-    '<p class="hint">Signed in as ' + esc(S.user.email) + '</p><button class="btn" type="submit">Save</button></form>' +
-    '<form id="pwform" class="card big stack" novalidate><h3>Change password</h3><div class="field"><label for="np">New password</label><input id="np" type="password" autocomplete="new-password" placeholder="At least 8 characters"></div><button class="btn" type="submit">Change password</button></form>' +
-    '<div class="card big stack"><button class="btn line" data-action="logout">Log out</button><div class="row"><a class="link" href="#/privacy">Privacy policy</a><a class="link" href="#/terms">Terms of use</a></div></div>' +
-    '<div class="card big stack"><h3>Delete my account</h3><p class="sub">This permanently removes your account and everything you have recorded. It cannot be undone.</p><button class="btn danger" data-action="delete-account">Delete my account and data</button></div>', 'account');
+function viewHome() {
+  const h = computeHome();
+  const noAccounts = !activeAccounts().length;
+  const noIncome = !state.txns.some((t) => t.kind === 'income');
+  const noSpend = !state.txns.some((t) => t.kind === 'expense');
+  const steps = `<div class="card"><h2>Let's get started</h2><ol class="steps">
+      <li class="${noAccounts ? '' : 'done'}"><b>Add your accounts</b> (chequing, savings, credit cards). <a href="#accounts">Go to Accounts</a></li>
+      <li class="${noIncome ? '' : 'done'}"><b>Tap “I got paid”</b> when your pay lands on the 1st.</li>
+      <li class="${noSpend ? '' : 'done'}"><b>Tap “I spent”</b> each time you buy something.</li></ol></div>`;
+
+  const banners = h.reminders.map((r) => `<div class="banner ${r.level === 'soon' ? 'warn' : 'bad'}" role="alert"><span aria-hidden="true">${r.level === 'soon' ? '◐' : '⚠'}</span>
+    <div><b>${esc(r.account.name)}</b>: ${dueLabel(r)} (${esc(r.dueOn)})${r.minCents != null ? ` · minimum ${fmtCad(r.minCents)}` : ''}
+    <div class="small">Record the payment with “Pay a card” and this reminder clears.</div></div></div>`).join('');
+
+  const left = h.allowanceCents === 0 && h.spend.totalPersonalCents === 0
+    ? stat('Left to spend', '—', 'Tap “I got paid” to start this month')
+    : (() => { const st = categoryStatus(h.allowanceCents, h.spend.totalPersonalCents, { warnAt: (state.settings?.warn_at_percent ?? 90) / 100 });
+        return stat('Left to spend', `<span class="${st.state}">${st.icon} ${fmtCad(h.leftCents)}</span>`, `${st.label} · allowance minus what you spent`); })();
+
+  const awaitingHtml = h.awaiting.length ? h.awaiting.map((p) => `<div class="small" style="margin-top:.35rem"><b>${fmtCad(p.totalReimbursableCents)}</b> for ${esc(p.period.label)}, expected ${esc(p.expectedReimbursementDate)}</div>`).join('') : '';
+  const rentHtml = h.fundingReceived > 0 || h.rent.heldForRentCents > 0
+    ? stat('Held for rent', fmtCad(h.rent.heldForRentCents), 'Rent funding is not spendable. It is released when you pay the card that was charged rent.') : '';
+
+  const groups = GROUP_ORDER.map((t) => [t, h.balances.filter((b) => b.type === t)]).filter(([, l]) => l.length);
+  const accts = groups.length ? `<div class="card"><h2>Your accounts</h2><div class="small muted" style="margin-bottom:.5rem">Actual balances in each account. This is not the same as money left to spend.</div>
+    ${groups.map(([t, l]) => `<h3 class="group-h2">${GROUP_LABELS[t]}</h3>${l.map((b) => `<div class="row line"><span>${esc(b.name)}</span><span class="amount">${b.type === 'credit_card' ? (b.owedCents ? `Owed ${fmtCad(b.owedCents)}` : fmtCad(b.balanceCents)) : fmtCad(b.balanceCents)}</span></div>`).join('')}`).join('')}</div>` : '';
+
+  const recent = state.txns.slice(0, 5);
+  const items = displayItems(recent);
+  return `<div class="wrap"><div class="page-head"><div><h1>This month</h1><div class="small muted">${esc(h.month.label)}</div></div></div>
+    <div class="big-actions">
+      <button class="big primary" data-act="add-paid"><span aria-hidden="true">＋</span> I got paid</button>
+      <button class="big" data-act="add-spent"><span aria-hidden="true">−</span> I spent</button>
+      <button class="big" data-act="add-transfer"><span aria-hidden="true">⇄</span> Pay a card / move money</button></div>
+    ${noAccounts || noIncome || noSpend ? steps : ''}
+    ${banners}
+    <div class="stats">
+      ${stat('Allowance received', fmtCad(h.allowanceCents), 'Money you can budget this month')}
+      ${stat('You spent', fmtCad(h.spend.totalPersonalCents), 'Your own cost. Reimbursable parts are not counted here.')}
+      ${left}
+      ${stat('Reimbursement coming', fmtCad(sum(h.awaiting.map((p) => p.totalReimbursableCents))), 'Not cash yet. Do not count it as available.', awaitingHtml)}
+      ${rentHtml}</div>
+    ${accts}
+    <div class="card"><div class="row"><h2>Recent</h2><a href="#activity">See all</a></div>
+      ${items.length ? renderItems(items) : '<p class="muted small">Nothing yet.</p>'}</div></div>`;
 }
 
-function viewLegal(kind) {
-  const inner = kind === 'privacy'
-    ? '<h1>Privacy policy</h1><div class="card big legal stack"><p>EverReady is a small private app run by an individual in Canada for family and friends. It is not a business and is not open to the public.</p>' +
-      '<h2>What we collect</h2><p>Your email address, your household name and size, and the supplies you record (weeks stocked, purchase years, quantities, shelf life and notes).</p>' +
-      '<h2>Who can see it</h2><p>You can see your own household. The app administrator can view all households\' records, including what each has and is missing. Other households can never see yours. Your data is not sold, shared with advertisers or used for anything else.</p>' +
-      '<h2>Where it is stored</h2><p>In a database hosted in Canada (Montreal) with Supabase. The website is served by Vercel. Passwords are stored only as secure hashes.</p>' +
-      '<h2>Your choices</h2><p>You can change your details or delete your account and all your data yourself from the Account page at any time. You can also ask the administrator to do it for you.</p>' +
-      '<h2>Questions</h2><p>Ask the person who invited you. This policy is written in plain language and may be updated as the app changes.</p></div>'
-    : '<h1>Terms of use</h1><div class="card big legal stack"><p>EverReady is a private, invite-only tool provided free of charge as a convenience. By using it you agree to these simple terms.</p>' +
-      '<ul><li>Use it only for your own household\'s preparedness planning.</li><li>Keep your password private. You are responsible for activity on your account.</li><li>The supply list is a general guide. It is not professional emergency, medical or safety advice.</li><li>The app is provided as is, with no guarantee it will always be available or error free. Keep your own copy of anything important.</li><li>The administrator may remove accounts or change the app at any time.</li></ul></div>';
-  return shell('<a class="back" href="javascript:history.back()">' + icon.back + 'Back</a>' + inner, 'account');
-}
-function notFound() { return shell('<h1>Not found</h1><p class="sub">That page does not exist.</p><a class="btn" href="#/">Go home</a>', 'home'); }
-
-/* ---------- admin views ---------- */
-function hhStats(h) {
-  const rows = S.all.rows.get(h.id) || new Map();
-  const bat = S.all.bat.get(h.id) || [];
-  const act = S.all.items.filter((i) => i.active);
-  return Object.assign({ h, rows, bat }, summarize(act, rows, bat));
-}
-function inviteLink() { return location.origin + location.pathname + '?invite=' + encodeURIComponent(S.settings.invite_code || ''); }
-
-function viewAdmin() {
-  const stats = S.all.households.map(hhStats);
-  const avg = stats.length ? stats.reduce((a, s) => a + s.ready, 0) / stats.length : 0;
-  const on = S.settings.invites_enabled === 'true';
-  const rows = stats.map((s) => '<tr class="click" data-action="go" data-to="#/admin/hh/' + s.h.id + '"><td><a href="#/admin/hh/' + s.h.id + '" style="font-weight:700;color:var(--ink);text-decoration:none">' + esc(s.h.name) + '</a><div class="hint">' + esc(s.h.email || '') + '</div></td><td>' + s.h.people + '</td><td style="min-width:150px"><div class="row" style="flex-wrap:nowrap">' + '<div style="flex:1">' + bar(s.ready) + '</div><b style="width:40px">' + pctText(s.ready) + '</b></div></td><td>' + s.low + '</td><td>' + s.expiring + '</td><td class="sub">' + relDay(s.h.last_active_at) + '</td></tr>').join('');
-  return shell('<div class="between"><h1>Admin</h1><div class="row"><a class="btn line small" href="#/admin/master">Master list</a><button class="btn small" data-action="backup">Download backup</button></div></div>' +
-    '<div class="grid"><div class="card stat"><span class="eyebrow">Households</span><b>' + stats.length + '</b></div><div class="card stat"><span class="eyebrow">Average readiness</span><b>' + pctText(avg) + '</b></div><div class="card stat"><span class="eyebrow">Items low</span><b>' + stats.reduce((a, s) => a + s.low, 0) + '</b></div><div class="card stat"><span class="eyebrow">Expiring or expired</span><b>' + stats.reduce((a, s) => a + s.expiring, 0) + '</b></div></div>' +
-    '<section class="card big stack"><h2 style="font-size:18px">All households</h2><div class="scroll"><table><thead><tr><th>Household</th><th>People</th><th>Readiness</th><th>Low</th><th>Expiring</th><th>Last active</th></tr></thead><tbody>' + (rows || '<tr><td colspan="6" class="sub">No households yet.</td></tr>') + '</tbody></table></div></section>' +
-    '<section class="card big stack"><h2 style="font-size:18px">Invite link</h2><p class="sub">Anyone with this link can create a household account. Status: <b>' + (on ? 'on' : 'off') + '</b></p>' +
-    '<div class="mono">' + esc(inviteLink()) + '</div><div class="row"><button class="btn line small" data-action="copy-invite">Copy link</button><button class="btn line small" data-action="new-invite">Replace link</button><button class="btn ' + (on ? 'danger' : '') + ' small" data-action="toggle-invite">' + (on ? 'Turn off' : 'Turn on') + '</button></div></section>', 'admin', true);
+// merge two-row transfers into one display item
+function displayItems(txns) {
+  const seen = new Set();
+  const items = [];
+  for (const t of txns) {
+    if (t.kind === 'transfer') {
+      if (seen.has(t.transfer_group_id)) continue;
+      seen.add(t.transfer_group_id);
+      const legs = state.txns.filter((x) => x.transfer_group_id === t.transfer_group_id);
+      items.push({ type: 'transfer', t: legs.find((l) => l.amount_cents < 0) ?? t, out: legs.find((l) => l.amount_cents < 0), inn: legs.find((l) => l.amount_cents > 0) });
+    } else items.push({ type: t.kind, t });
+  }
+  return items;
 }
 
-function viewAdminHousehold(id) {
-  const h = S.all.households.find((x) => x.id === id); if (!h) return notFound();
-  const s = hhStats(h);
-  const act = S.all.items.filter((i) => i.active);
-  const cats = S.all.cats.filter((c) => c.active);
-  const catRows = cats.map((c) => {
-    const its = act.filter((i) => i.category_id === c.id);
-    const sm = summarize(its, s.rows, []);
-    return '<div class="row" style="flex-wrap:nowrap"><span style="flex:0 0 170px;font-weight:600;font-size:14px">' + esc(c.name) + '</span><div style="flex:1">' + bar(sm.ready) + '</div><b style="width:44px;text-align:right">' + pctText(sm.ready) + '</b></div>';
-  }).join('');
-  const itemById = new Map(S.all.items.map((i) => [i.id, i]));
-  const detail = cats.map((c) => {
-    const its = act.filter((i) => i.category_id === c.id);
-    const trs = its.map((it) => {
-      const r = s.rows.get(it.id); const st = itemState(it, r);
-      const val = it.recommended_weeks ? (((r && r.weeks_stocked) || 0) + ' / ' + it.recommended_weeks + ' wk') : (r && r.done ? 'Done' : '—');
-      const kit = it.portable !== 'none' && r && r.portable_done ? ' <span class="pill kit">kit</span>' : '';
-      return '<tr><td>' + esc(it.name) + (it.group_title ? '<div class="hint">' + esc(it.group_title) + '</div>' : '') + (r && r.notes ? '<div class="hint">Note: ' + esc(r.notes) + '</div>' : '') + '</td><td>' + esc(val) + kit + '</td><td><span class="pill ' + (st === 'complete' ? 'home' : st === 'low' ? 'bad' : '') + '">' + (st === 'complete' ? 'Complete' : st === 'low' ? 'Low' : 'Empty') + '</span></td></tr>';
-    }).join('');
-    return '<details class="card"><summary style="cursor:pointer;font-weight:700;min-height:44px;display:flex;align-items:center">' + esc(c.name) + '</summary><div class="scroll"><table><tbody>' + trs + '</tbody></table></div></details>';
-  }).join('');
-  const bt = s.bat.slice().sort((a, b) => (a.expiry_year || 9999) - (b.expiry_year || 9999)).map((b) => {
-    const it = itemById.get(b.item_id); const st = batchStatus(b);
-    return '<tr><td>' + esc(it ? it.name : '?') + '</td><td>' + b.purchase_year + '</td><td>' + esc(b.quantity || '') + '</td><td>' + (b.expiry_year || '—') + '</td><td><span class="pill ' + st.cls + '">' + esc(st.label) + '</span></td></tr>';
-  }).join('');
-  return shell('<a class="back" href="#/admin">' + icon.back + 'All households</a>' +
-    '<div class="stack" style="gap:2px"><span class="eyebrow">Full view</span><h1>' + esc(h.name) + '</h1><span class="sub">' + h.people + ' people · ' + esc(h.email || '') + ' · ' + pctText(s.ready) + ' ready · last active ' + relDay(h.last_active_at) + '</span></div>' +
-    '<div class="two"><section class="card big stack"><h2 style="font-size:18px">Progress by category</h2>' + catRows + '</section>' +
-    '<section class="card big stack"><h2 style="font-size:18px">Account tools</h2><p class="sub">Set a new password (tell them in person), or remove the account and all its data.</p><div class="row"><button class="btn line small" data-action="admin-pw" data-id="' + h.id + '">Set new password</button><button class="btn danger small" data-action="admin-del" data-id="' + h.id + '">Remove household</button></div></section></div>' +
-    '<section class="stack"><h2>All items</h2>' + detail + '</section>' +
-    '<section class="card big stack"><h2 style="font-size:18px">Purchases</h2><div class="scroll"><table><thead><tr><th>Item</th><th>Year</th><th>Qty</th><th>Expiry</th><th>Status</th></tr></thead><tbody>' + (bt || '<tr><td colspan="5" class="sub">None recorded.</td></tr>') + '</tbody></table></div></section>', 'admin', true);
-}
-
-function viewAdminMaster() {
-  const cats = S.all.cats;
-  const body = cats.map((c) => {
-    const its = S.all.items.filter((i) => i.category_id === c.id);
-    return '<section class="card big stack"><div class="between"><h2 style="font-size:19px">' + esc(c.name) + (c.active ? '' : ' <span class="pill">hidden</span>') + '</h2><div class="row"><button class="btn line small" data-action="edit-cat" data-id="' + c.id + '">Edit</button><button class="btn small" data-action="add-item" data-cat="' + c.id + '">Add item</button></div></div><div class="scroll"><table><tbody>' +
-      its.map((i) => '<tr><td>' + esc(i.name) + (i.group_title ? '<div class="hint">' + esc(i.group_title) + '</div>' : '') + (i.active ? '' : ' <span class="pill">hidden</span>') + '</td><td class="sub">' + (i.recommended_weeks ? i.recommended_weeks + ' wk' : 'checkbox') + '</td><td><button class="link" data-action="edit-item" data-id="' + i.id + '">Edit</button></td></tr>').join('') + '</tbody></table></div></section>';
-  }).join('');
-  return shell('<a class="back" href="#/admin">' + icon.back + 'Admin</a><div class="between"><h1>Master list</h1><button class="btn small" data-action="add-cat">Add category</button></div><p class="sub">Changes apply to everyone straight away. Hiding an item keeps everyone\'s progress; it just stops showing.</p>' + body, 'admin', true);
-}
-
-/* ---------- router ---------- */
-async function route() {
-  const hash = location.hash || '#/';
-  const m = hash.replace(/^#\/?/, '').split('/');
-  if (!S.user) { $app.innerHTML = viewAuth(m[0] === 'signup' ? 'signup' : 'login'); return; }
-  if (!S.loaded) { $app.innerHTML = '<p class="boot">Loading your household…</p>'; return; }
-  const y = window.scrollY; let html;
-  try {
-    if (m[0] === 'admin') {
-      if (!S.admin) { html = notFound(); }
-      else {
-        await loadAdminData();
-        if (m[1] === 'hh') html = viewAdminHousehold(m[2]);
-        else if (m[1] === 'master') html = viewAdminMaster();
-        else html = viewAdmin();
-      }
-    } else if (m[0] === 'cat') html = viewCategory(Number(m[1]));
-    else if (m[0] === 'item') html = viewItem(Number(m[1]));
-    else if (m[0] === 'account') html = viewAccount();
-    else if (m[0] === 'privacy' || m[0] === 'terms') html = viewLegal(m[0]);
-    else if (m[0] === 'login' || m[0] === 'signup' || m[0] === '') html = viewDashboard();
-    else html = notFound();
-  } catch (e) { html = shell('<div class="err">' + esc(friendly(e)) + '</div>', 'home'); }
-  $app.innerHTML = html;
-  if (window.__keepScroll) { window.scrollTo(0, y); window.__keepScroll = false; } else window.scrollTo(0, 0);
-}
-function rerender() { window.__keepScroll = true; route(); }
-
-/* ---------- writes ---------- */
-async function saveRow(itemId, patch) {
-  const prev = S.hi.get(itemId);
-  const next = Object.assign({ household_id: S.hh.id, item_id: itemId, weeks_stocked: 0, done: false, portable_done: false, notes: null }, prev || {}, patch);
-  S.hi.set(itemId, next);
-  rerender();
-  const payload = Object.assign({ household_id: S.hh.id, item_id: itemId }, patch);
-  const { error } = await sb.from('household_items').upsert(payload, { onConflict: 'household_id,item_id' });
-  if (error) { toast('Could not save. Please try again.'); if (prev) S.hi.set(itemId, prev); else S.hi.delete(itemId); rerender(); }
-}
-
-/* ---------- master-list dialogs ---------- */
-const dlg = document.getElementById('dlg');
-function openDlg(html) { dlg.innerHTML = html; if (!dlg.open) dlg.showModal(); }
-function closeDlg() { if (dlg.open) dlg.close(); }
-function itemForm(it, catId) {
-  const cats = S.all.cats;
-  const v = it || { category_id: catId, group_title: '', name: '', notes: '', recommended_weeks: null, is_optional: false, at_home: true, portable: 'none', target_quantity: '', liters_per_person_per_day: null, default_shelf_life_years: null, active: true };
-  return '<form id="itemform" data-id="' + (it ? it.id : '') + '" class="stack" novalidate><h2>' + (it ? 'Edit item' : 'Add item') + '</h2><div id="dmsg"></div>' +
-    '<div class="field"><label for="f_cat">Category</label><select id="f_cat">' + cats.map((c) => '<option value="' + c.id + '"' + (c.id === v.category_id ? ' selected' : '') + '>' + esc(c.name) + '</option>').join('') + '</select></div>' +
-    '<div class="field"><label for="f_name">Name</label><input id="f_name" type="text" maxlength="120" value="' + esc(v.name) + '"></div>' +
-    '<div class="field"><label for="f_grp">Group heading (optional)</label><input id="f_grp" type="text" maxlength="120" value="' + esc(v.group_title || '') + '"></div>' +
-    '<div class="field"><label for="f_notes">Instructions / notes</label><textarea id="f_notes" maxlength="1000">' + esc(v.notes || '') + '</textarea></div>' +
-    '<div class="field"><label for="f_wk">Recommended weeks (1–10, blank = simple checkbox)</label><input id="f_wk" type="number" min="1" max="10" value="' + (v.recommended_weeks || '') + '"></div>' +
-    '<div class="field"><label for="f_tq">Target quantity (text, optional)</label><input id="f_tq" type="text" maxlength="60" value="' + esc(v.target_quantity || '') + '"></div>' +
-    '<div class="field"><label for="f_lt">Litres per person per day (water only)</label><input id="f_lt" type="number" step="0.5" min="0" value="' + (v.liters_per_person_per_day || '') + '"></div>' +
-    '<div class="field"><label for="f_sl">Suggested shelf life in years (optional)</label><input id="f_sl" type="number" min="1" max="100" value="' + (v.default_shelf_life_years || '') + '"></div>' +
-    '<div class="field"><label for="f_pt">Portable kit</label><select id="f_pt"><option value="none"' + (v.portable === 'none' ? ' selected' : '') + '>Not in kit</option><option value="small"' + (v.portable === 'small' ? ' selected' : '') + '>Small amount in kit</option><option value="full"' + (v.portable === 'full' ? ' selected' : '') + '>Portable kit item</option></select></div>' +
-    '<div class="row"><label style="margin:0;display:flex;gap:8px;align-items:center"><input id="f_home" type="checkbox"' + (v.at_home ? ' checked' : '') + '> At home</label><label style="margin:0;display:flex;gap:8px;align-items:center"><input id="f_opt" type="checkbox"' + (v.is_optional ? ' checked' : '') + '> Optional</label><label style="margin:0;display:flex;gap:8px;align-items:center"><input id="f_act" type="checkbox"' + (v.active ? ' checked' : '') + '> Shown to everyone</label></div>' +
-    '<div class="row"><button class="btn" type="submit">Save</button><button class="btn line" type="button" data-action="close-dlg">Cancel</button></div></form>';
-}
-function catForm(c) {
-  const v = c || { name: '', label: '', active: true };
-  return '<form id="catform" data-id="' + (c ? c.id : '') + '" class="stack" novalidate><h2>' + (c ? 'Edit category' : 'Add category') + '</h2><div id="dmsg"></div>' +
-    '<div class="field"><label for="c_name">Name</label><input id="c_name" type="text" maxlength="80" value="' + esc(v.name) + '"></div>' +
-    '<div class="field"><label for="c_label">Label (optional)</label><input id="c_label" type="text" maxlength="60" value="' + esc(v.label || '') + '"></div>' +
-    '<label style="display:flex;gap:8px;align-items:center"><input id="c_act" type="checkbox"' + (v.active ? ' checked' : '') + '> Shown to everyone</label>' +
-    '<div class="row"><button class="btn" type="submit">Save</button><button class="btn line" type="button" data-action="close-dlg">Cancel</button></div></form>';
-}
-async function refreshBase() {
-  const [c, i] = await Promise.all([sb.from('categories').select('*').eq('active', true).order('sort_order'), sb.from('items').select('*').eq('active', true).order('sort_order')]);
-  if (!c.error) S.cats = c.data; if (!i.error) S.items = i.data;
-}
-
-/* ---------- events ---------- */
-document.addEventListener('click', async (e) => {
-  const el = e.target.closest('[data-action]'); if (!el) return;
-  const a = el.dataset.action;
-  try {
-    if (a === 'week') {
-      const id = Number(el.dataset.item), n = Number(el.dataset.n);
-      const cur = (S.hi.get(id) || {}).weeks_stocked || 0;
-      saveRow(id, { weeks_stocked: cur === n ? n - 1 : n });
-    } else if (a === 'done') {
-      const id = Number(el.dataset.item); saveRow(id, { done: !((S.hi.get(id) || {}).done) });
-    } else if (a === 'kit') {
-      const id = Number(el.dataset.item); saveRow(id, { portable_done: !((S.hi.get(id) || {}).portable_done) });
-    } else if (a === 'filter') { S.filter = el.dataset.f; rerender(); }
-    else if (a === 'people') {
-      const pc = $('#pc'); const n = Math.max(1, Math.min(50, Number(pc.textContent) + Number(el.dataset.d))); pc.textContent = n;
-    } else if (a === 'go') { location.hash = el.dataset.to; }
-    else if (a === 'logout') { await sb.auth.signOut(); }
-    else if (a === 'batch-used') {
-      const b = S.batches.find((x) => x.id === el.dataset.id); const used = !b.used;
-      const { error } = await sb.from('purchase_batches').update({ used, used_at: used ? new Date().toISOString() : null }).eq('id', b.id);
-      if (error) throw error; b.used = used; rerender();
-    } else if (a === 'batch-del') {
-      if (!confirm('Delete this purchase?')) return;
-      const { error } = await sb.from('purchase_batches').delete().eq('id', el.dataset.id);
-      if (error) throw error; S.batches = S.batches.filter((x) => x.id !== el.dataset.id); rerender();
-    } else if (a === 'delete-account') {
-      const t = prompt('This permanently deletes your account and all your data.\nType DELETE to confirm.');
-      if (t !== 'DELETE') return;
-      const { error } = await sb.rpc('delete_my_account'); if (error) throw error;
-      await sb.auth.signOut(); toast('Your account has been deleted.');
-    } else if (a === 'copy-invite') {
-      try { await navigator.clipboard.writeText(inviteLink()); toast('Invite link copied'); } catch (_) { prompt('Copy this link:', inviteLink()); }
-    } else if (a === 'new-invite') {
-      if (!confirm('Replace the invite link? The old link will stop working.')) return;
-      const code = Array.from(crypto.getRandomValues(new Uint8Array(12))).map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
-      const { error } = await sb.from('app_settings').upsert({ key: 'invite_code', value: code }); if (error) throw error;
-      S.settings.invite_code = code; toast('New invite link created'); rerender();
-    } else if (a === 'toggle-invite') {
-      const v = S.settings.invites_enabled === 'true' ? 'false' : 'true';
-      const { error } = await sb.from('app_settings').upsert({ key: 'invites_enabled', value: v }); if (error) throw error;
-      S.settings.invites_enabled = v; rerender();
-    } else if (a === 'backup') {
-      const out = { exported_at: new Date().toISOString() };
-      for (const t of ['categories', 'items', 'households', 'household_items', 'purchase_batches']) {
-        const r = await sb.from(t).select('*'); if (r.error) throw r.error; out[t] = r.data;
-      }
-      const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
-      const link = document.createElement('a'); link.href = URL.createObjectURL(blob);
-      link.download = 'everready-backup-' + new Date().toISOString().slice(0, 10) + '.json'; link.click();
-      setTimeout(() => URL.revokeObjectURL(link.href), 4000); toast('Backup downloaded');
-    } else if (a === 'admin-pw') {
-      const h = S.all.households.find((x) => x.id === el.dataset.id);
-      const pw = prompt('New password for ' + h.name + ' (at least 8 characters):'); if (!pw) return;
-      const { error } = await sb.rpc('admin_set_password', { target: h.owner_id, new_password: pw }); if (error) throw error;
-      toast('Password updated. Tell them in person.');
-    } else if (a === 'admin-del') {
-      const h = S.all.households.find((x) => x.id === el.dataset.id);
-      if (!confirm('Permanently remove "' + h.name + '" and all of its data?')) return;
-      const { error } = await sb.rpc('admin_delete_user', { target: h.owner_id }); if (error) throw error;
-      toast('Household removed'); location.hash = '#/admin'; route();
-    } else if (a === 'edit-item') { openDlg(itemForm(S.all.items.find((x) => x.id === Number(el.dataset.id)))); }
-    else if (a === 'add-item') { openDlg(itemForm(null, Number(el.dataset.cat))); }
-    else if (a === 'edit-cat') { openDlg(catForm(S.all.cats.find((x) => x.id === Number(el.dataset.id)))); }
-    else if (a === 'add-cat') { openDlg(catForm(null)); }
-    else if (a === 'close-dlg') { closeDlg(); }
-  } catch (err) { toast(friendly(err)); }
-});
-
-document.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const f = e.target; const msg = $('#msg') || $('#dmsg');
-  const say = (t, ok) => { if (msg) msg.innerHTML = '<div class="' + (ok ? 'ok' : 'err') + '">' + esc(t) + '</div>'; };
-  const btn = f.querySelector('button[type=submit]'); if (btn) btn.disabled = true;
-  try {
-    if (f.id === 'login') {
-      const { error } = await sb.auth.signInWithPassword({ email: $('#em').value.trim(), password: $('#pw').value });
-      if (error) throw error;
-    } else if (f.id === 'signup') {
-      const name = $('#hn').value.trim(); const email = $('#em').value.trim(); const pw = $('#pw').value;
-      if (!name) throw new Error('Please enter a household name.');
-      if (!email) throw new Error('Please enter your email.');
-      if (pw.length < 8) throw new Error('Please choose a password with at least 8 characters.');
-      const { data, error } = await sb.auth.signUp({ email, password: pw, options: { data: { household_name: name, people: Number($('#pc').textContent), invite_code: sessionStorage.getItem('er_invite') || '' } } });
-      if (error) throw error;
-      if (!data.session) throw new Error('Email confirmation is still switched on in Supabase. See the setup guide.');
-    } else if (f.id === 'acct') {
-      const name = $('#an').value.trim(); if (!name) throw new Error('Please enter a household name.');
-      const people = Number($('#pc').textContent);
-      const { error } = await sb.from('households').update({ name, people }).eq('id', S.hh.id); if (error) throw error;
-      S.hh.name = name; S.hh.people = people; say('Saved.', true);
-    } else if (f.id === 'pwform') {
-      const pw = $('#np').value; if (pw.length < 8) throw new Error('Please choose a password with at least 8 characters.');
-      const { error } = await sb.auth.updateUser({ password: pw }); if (error) throw error;
-      $('#np').value = ''; say('Password changed.', true);
-    } else if (f.id === 'addbatch') {
-      const itemId = Number(f.dataset.item);
-      const year = Number($('#py').value); if (!(year >= 1980 && year <= 2200)) throw new Error('Please enter a valid year.');
-      const sl = $('#ps').value ? Number($('#ps').value) : null;
-      const d = $('#pd').value.trim(); if (d && !/^\d{4}-\d{2}-\d{2}$/.test(d)) throw new Error('Use the date format 2026-11-14, or leave it blank.');
-      const row = { household_id: S.hh.id, item_id: itemId, purchase_year: year, quantity: $('#pq').value.trim() || null, shelf_life_years: sl, exact_date: d || null, note: $('#pn').value.trim() || null };
-      const { data, error } = await sb.from('purchase_batches').insert(row).select().single(); if (error) throw error;
-      S.batches.push(data); toast('Purchase saved'); rerender();
-    } else if (f.id === 'itemform') {
-      const name = $('#f_name').value.trim(); if (!name) throw new Error('Please enter a name.');
-      const wk = $('#f_wk').value ? Number($('#f_wk').value) : null; if (wk !== null && (wk < 1 || wk > 10)) throw new Error('Weeks must be between 1 and 10.');
-      const rec = { category_id: Number($('#f_cat').value), name, group_title: $('#f_grp').value.trim() || null, notes: $('#f_notes').value.trim() || null, recommended_weeks: wk, target_quantity: $('#f_tq').value.trim() || null, liters_per_person_per_day: $('#f_lt').value ? Number($('#f_lt').value) : null, default_shelf_life_years: $('#f_sl').value ? Number($('#f_sl').value) : null, portable: $('#f_pt').value, at_home: $('#f_home').checked, is_optional: $('#f_opt').checked, active: $('#f_act').checked };
-      let r;
-      if (f.dataset.id) r = await sb.from('items').update(rec).eq('id', Number(f.dataset.id));
-      else { rec.sort_order = Math.max(0, ...S.all.items.map((i) => i.sort_order)) + 1; r = await sb.from('items').insert(rec); }
-      if (r.error) throw r.error; closeDlg(); await refreshBase(); toast('Saved'); route();
-    } else if (f.id === 'catform') {
-      const name = $('#c_name').value.trim(); if (!name) throw new Error('Please enter a name.');
-      const rec = { name, label: $('#c_label').value.trim() || null, active: $('#c_act').checked };
-      let r;
-      if (f.dataset.id) r = await sb.from('categories').update(rec).eq('id', Number(f.dataset.id));
-      else { rec.sort_order = Math.max(0, ...S.all.cats.map((c) => c.sort_order)) + 1; r = await sb.from('categories').insert(rec); }
-      if (r.error) throw r.error; closeDlg(); await refreshBase(); toast('Saved'); route();
+function renderItems(items) {
+  const reimb = reimbursableByLine(expenseLines(), rulesFromState(todayLocal()));
+  const lineByTxn = new Map(state.lines.map((l) => [l.transaction_id, l]));
+  const acct = (id) => esc(byId(state.accounts, id)?.name ?? 'Unknown account');
+  const cat = (id) => esc(byId(state.categories, id)?.name ?? 'Uncategorized');
+  let lastDate = '';
+  return items.map((it) => {
+    const t = it.t;
+    let title, sub, amt, cls = '', extra = '';
+    if (it.type === 'expense') {
+      const l = lineByTxn.get(t.id);
+      title = esc(t.payee || byId(state.categories, l?.category_id)?.name || 'Purchase');
+      sub = `${cat(l?.category_id)} · ${acct(t.account_id)}`;
+      amt = `−${fmtCad(-t.amount_cents)}`;
+      const r = reimb[l?.id]?.reimbursableCents ?? 0;
+      if (l?.reimb_budget) extra = `<div class="small"><span class="badge">Work: ${BUDGET_LABELS[l.reimb_budget]}</span> ${r > 0 ? `${fmtCad(r)} reimbursable · ${fmtCad(-t.amount_cents - r)} yours` : 'no reimbursement'}</div>`;
+    } else if (it.type === 'income') {
+      title = INCOME_LABELS[t.income_source] ?? 'Income'; sub = `Into ${acct(t.account_id)}`; amt = `+${fmtCad(t.amount_cents)}`; cls = 'pos';
+      if (t.income_source === 'rent_funding') extra = '<div class="small muted">Held for rent, not spendable</div>';
+      if (t.income_source === 'reimbursement') extra = '<div class="small muted">Settles a claim, not new spending money</div>';
+    } else {
+      title = 'Transfer'; sub = `${acct(it.out?.account_id)} → ${acct(it.inn?.account_id)}`; amt = fmtCad(Math.abs(t.amount_cents));
+      extra = `<div class="small muted">Not spending${it.out?.is_rent_settlement ? ' · settles rent charge' : ''}</div>`;
     }
-  } catch (err) { say(friendly(err)); }
-  if (btn) btn.disabled = false;
-});
-
-document.addEventListener('focusout', async (e) => {
-  const t = e.target;
-  if (t.id === 'nt') {
-    const id = Number(t.dataset.item); const v = t.value.trim() || null;
-    if (((S.hi.get(id) || {}).notes || null) === v) return;
-    const prev = S.hi.get(id);
-    S.hi.set(id, Object.assign({ household_id: S.hh.id, item_id: id, weeks_stocked: 0, done: false, portable_done: false }, prev || {}, { notes: v }));
-    const { error } = await sb.from('household_items').upsert({ household_id: S.hh.id, item_id: id, notes: v }, { onConflict: 'household_id,item_id' });
-    if (error) toast('Could not save your note.'); else toast('Note saved');
-  }
-});
-
-window.addEventListener('hashchange', route);
-
-/* ---------- boot ---------- */
-(function captureInvite() {
-  const p = new URLSearchParams(location.search).get('invite');
-  if (p) { sessionStorage.setItem('er_invite', p); history.replaceState(null, '', location.pathname + '#/signup'); }
-})();
-
-let booting = false;
-async function onSession(session) {
-  if (!session) { S.user = null; S.loaded = false; S.hh = null; S.admin = false; if (!/^#\/(signup|login)/.test(location.hash)) location.hash = sessionStorage.getItem('er_invite') ? '#/signup' : '#/login'; route(); return; }
-  if (booting || (S.user && S.user.id === session.user.id && S.loaded)) return;
-  booting = true; S.user = session.user;
-  $app.innerHTML = '<p class="boot">Loading your household…</p>';
-  try { await loadAll(); if (/^#\/(signup|login)/.test(location.hash)) location.hash = '#/'; route(); }
-  catch (err) { $app.innerHTML = '<div class="auth"><div class="err">' + esc(friendly(err)) + '</div><button class="btn line" data-action="logout">Log out</button></div>'; }
-  booting = false;
+    const head = t.date !== lastDate ? `<div class="date-h">${esc(t.date)}</div>` : '';
+    lastDate = t.date;
+    return `${head}<div class="txn"><div class="grow"><div class="txn-title">${title}</div><div class="small muted">${sub}</div>${extra}</div>
+      <div class="txn-side"><div class="amount ${cls}">${amt}</div>
+      <div class="txn-actions">${it.type === 'expense' ? `<button class="small" data-act="edit-spent" data-id="${t.id}">Edit</button>` : ''}
+      <button class="small danger" data-act="delete-txn" data-id="${t.id}" data-type="${it.type}">Delete</button></div></div></div>`;
+  }).join('');
 }
-sb.auth.onAuthStateChange((_evt, session) => { setTimeout(() => onSession(session), 0); });
-sb.auth.getSession().then(({ data }) => onSession(data.session));
+
+function viewActivity() {
+  const key = state.month ?? monthKey(todayLocal());
+  const list = state.txns.filter((t) => monthKey(t.date) === key);
+  const label = calendarMonthOf(`${key}-01`).label;
+  const items = displayItems(list);
+  return `<div class="wrap"><div class="page-head"><h1>Activity</h1></div>
+    <div class="month-nav"><button data-act="month" data-dir="-1" aria-label="Previous month">‹</button><div><b>${esc(label)}</b></div>
+      <button data-act="month" data-dir="1" aria-label="Next month">›</button></div>
+    <div class="card">${items.length ? renderItems(items) : '<p class="muted">Nothing recorded this month.</p>'}</div></div>`;
+}
+
+function dueText(a) {
+  if (a.type !== 'credit_card' || !a.due_day) return '';
+  return `<div class="small" style="margin-top:.3rem">Due the ${ordinal(a.due_day)}${a.min_payment_cents != null ? ` · minimum ${fmtCad(a.min_payment_cents)}` : ''} · reminds ${a.remind_days} day${a.remind_days === 1 ? '' : 's'} before</div>`;
+}
+
+function viewAccounts() {
+  const active = activeAccounts();
+  const archived = state.accounts.filter((a) => a.archived_at);
+  const groups = GROUP_ORDER.map((t) => [t, active.filter((a) => a.type === t).sort(bySort)]).filter(([, l]) => l.length);
+  const card = (a, i, list) => {
+    const cc = a.type === 'credit_card';
+    const bal = cc
+      ? (a.opening_balance_cents <= 0 ? `Owed at start: ${fmtCad(-a.opening_balance_cents)}` : `Credit at start: ${fmtCad(a.opening_balance_cents)}`)
+      : `Opening balance: ${fmtCad(a.opening_balance_cents)}`;
+    return `<div class="card ${a.archived_at ? 'archived' : ''}">
+      <div class="row"><div><h3>${esc(a.name)}${a.nickname ? ` <span class="muted">· ${esc(a.nickname)}</span>` : ''}${a.last4 ? ` <span class="muted">••${esc(a.last4)}</span>` : ''}</h3>
+      <div class="small muted">${TYPES[a.type]} · ${bal} on ${esc(a.opening_date)}</div>${dueText(a)}</div>
+      ${a.archived_at ? '<span class="badge">Archived</span>' : ''}</div>
+      <div class="actions">
+        <button class="small" data-act="edit-account" data-id="${a.id}">Edit</button>
+        ${cc && a.due_day && !a.archived_at ? `<button class="small" data-act="card-calendar" data-id="${a.id}">Add to calendar</button>` : ''}
+        ${a.archived_at
+          ? `<button class="small" data-act="restore-account" data-id="${a.id}">Restore</button>`
+          : `<button class="small" data-act="move-account" data-id="${a.id}" data-dir="up" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button>
+             <button class="small" data-act="move-account" data-id="${a.id}" data-dir="down" ${i === list.length - 1 ? 'disabled' : ''} aria-label="Move down">↓</button>
+             <button class="small danger" data-act="archive-account" data-id="${a.id}">Archive</button>`}
+      </div></div>`;
+  };
+  return `<div class="wrap"><div class="page-head"><h1>Accounts</h1><button class="primary" data-act="add-account">+ Add account</button></div>
+    <div class="note">Accounts group themselves by type. Use ↑ ↓ to put your most-used first. For each credit card, set its due day and minimum payment so Peach can remind you. Never enter full account numbers.</div>
+    ${groups.length ? groups.map(([t, list]) => `<h2 class="group-h">${GROUP_LABELS[t]} <span class="muted small">(${list.length})</span></h2>${list.map((a, i) => card(a, i, list)).join('')}`).join('')
+      : '<p class="muted">No accounts yet. Add your chequing, savings, cards and cash.</p>'}
+    ${archived.length ? `<h2 class="group-h">Archived</h2>${archived.map((a) => card(a, 0, [a])).join('')}` : ''}</div>`;
+}
+
+function viewCategories() {
+  const tops = state.categories.filter((c) => !c.parent_id && !c.archived_at);
+  const kids = (id) => state.categories.filter((c) => c.parent_id === id && !c.archived_at);
+  const archived = state.categories.filter((c) => c.archived_at);
+  const item = (c, siblings, i, isChild) => `<div class="card">
+    <div class="row"><h3>${esc(c.name)}</h3>${c.kind !== 'expense' ? `<span class="badge">${esc(KINDS[c.kind] ?? c.kind)}</span>` : ''}</div>
+    <div class="actions">
+      <button class="small" data-act="edit-category" data-id="${c.id}">Rename</button>
+      ${isChild ? '' : `<button class="small" data-act="add-category" data-parent="${c.id}">+ Sub-category</button>`}
+      <button class="small" data-act="move-category" data-id="${c.id}" data-dir="up" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button>
+      <button class="small" data-act="move-category" data-id="${c.id}" data-dir="down" ${i === siblings.length - 1 ? 'disabled' : ''} aria-label="Move down">↓</button>
+      <button class="small danger" data-act="archive-category" data-id="${c.id}">Archive</button></div></div>`;
+  return `<div class="wrap"><div class="page-head"><h1>Categories</h1><button class="primary" data-act="add-category">+ Add category</button></div>
+    <p><a href="#settings">← Back to Settings</a></p>
+    <div class="note">Categories are what you spent on. Whether a purchase is reimbursed by work is a separate choice you make when you add it.</div>
+    ${tops.map((c, i) => `${item(c, tops, i, false)}${kids(c.id).length ? `<div class="sub">${kids(c.id).map((k, j, arr) => item(k, arr, j, true)).join('')}</div>` : ''}`).join('')}
+    ${archived.length ? `<h2 class="group-h">Archived</h2>${archived.map((c) => `<div class="card archived"><div class="row"><h3>${esc(c.name)}</h3>
+      <button class="small" data-act="restore-category" data-id="${c.id}">Restore</button></div></div>`).join('')}` : ''}</div>`;
+}
+
+function viewSettings() {
+  const s = state.settings;
+  if (!s) return '<div class="wrap"><p class="muted">Settings not loaded.</p></div>';
+  const periodExample = formatRange('2026-11-21', '2026-12-20').replace(/ \d{4}$/, '');
+  const sd = s.period_start_day;
+  const rows = state.rules;
+  const latest = (k) => rows.find((r) => r.budget_key === k);
+  return `<div class="wrap"><div class="page-head"><h1>Settings</h1></div>
+    <div class="card"><h2>Categories</h2><p class="small muted">Add, rename, reorder or archive what you spend on.</p><a class="btn" href="#categories">Open categories</a></div>
+
+    <div class="card"><h2>Pay amounts</h2>
+      <p class="small muted">These pre-fill the “I got paid” screen. Allowance is effective-dated, so a change never rewrites earlier months.</p>
+      ${state.allowance.map((a) => `<div class="row line"><div><span class="amount">${fmtCad(a.amount_cents)}</span> <span class="muted small">allowance per month, from ${esc(a.effective_from)}</span></div>
+        <button class="small danger" data-act="delete-allowance" data-id="${a.id}">Delete</button></div>`).join('') || '<p class="muted">None yet.</p>'}
+      <form data-form="allowance" class="stack" style="margin-top:.9rem"><div class="grid2">
+        <div class="field"><label>New monthly allowance (CAD)</label><input name="amount" inputmode="decimal" placeholder="600.00" required></div>
+        <div class="field"><label>Effective from</label><input type="date" name="effective_from" value="${todayLocal()}" required></div></div>
+      <button class="primary" type="submit">Add allowance amount</button></form>
+      <hr class="sep">
+      <form data-form="rentfunding" class="stack"><div class="field"><label>Monthly rent funding (CAD)</label><input name="rent" inputmode="decimal" value="${centsToInput(s.rent_funding_cents ?? 191800)}" required></div>
+      <button class="primary" type="submit">Save rent funding</button></form></div>
+
+    <div class="card"><h2>Start date</h2>
+      <p class="small muted">Tracking begins on this date. Opening balances are entered as of it.</p>
+      <form data-form="tracking" class="stack"><div class="field"><label>Tracking start date</label><input type="date" name="tracking_start" value="${esc(s.tracking_start)}" required></div>
+      <button class="primary" type="submit">Save start date</button></form></div>
+
+    <div class="card"><h2>Reimbursement periods and caps</h2>
+      <p class="small muted">Work expense period runs from the ${ordinal(sd)} to the day before, e.g. ${esc(periodExample)}. Personal budgets still use calendar months.</p>
+      <form data-form="rules" class="stack"><div class="grid2">
+        <div class="field"><label>Period starts on day (1–28)</label><input type="number" name="period_start_day" min="1" max="28" value="${sd}" required></div>
+        <div class="field"><label>Reimbursed on day (1–28)</label><input type="number" name="reimbursement_pay_day" min="1" max="28" value="${s.reimbursement_pay_day}" required></div></div>
+        <div class="field"><label>Warn when spending reaches (% of money)</label><input type="number" name="warn_at_percent" min="1" max="100" value="${s.warn_at_percent}" required></div>
+        <label class="check"><input type="checkbox" name="carry_over_unused" ${s.carry_over_unused ? 'checked' : ''}> Carry unused reimbursement cap into the next period (off = it expires)</label>
+        <button class="primary" type="submit">Save period rules</button></form>
+      <hr class="sep">
+      <form data-form="caps" class="stack"><div class="grid2">
+        <div class="field"><label>Communications cap per period</label><input name="communications" inputmode="decimal" value="${latest('communications') ? centsToInput(latest('communications').cap_cents) : ''}" required></div>
+        <div class="field"><label>Car fuel cap per period</label><input name="fuel" inputmode="decimal" value="${latest('fuel') ? centsToInput(latest('fuel').cap_cents) : ''}" required></div></div>
+        <div class="field"><label>Effective from</label><input type="date" name="effective_from" value="${esc(s.tracking_start)}" required></div>
+        <button class="primary" type="submit">Save caps</button></form>
+      <p class="small muted" style="margin-top:.75rem">${rows.map((r) => `${BUDGET_LABELS[r.budget_key]}: ${fmtCad(r.cap_cents)} from ${esc(r.effective_from)}`).join(' · ')}</p></div>
+
+    <div class="card"><h2>Your data</h2>
+      <p class="small muted">Free Supabase projects have no automatic backups. Download an export regularly (monthly is a good habit) and keep it somewhere safe. It contains your financial records.</p>
+      <div class="actions"><button data-act="export">Download all data (JSON)</button></div></div>
+
+    <div class="card"><h2>Account</h2><p class="small muted">Signed in as ${esc(state.session?.user?.email)}</p>
+      <div class="actions"><button data-act="sign-out">Sign out</button></div></div></div>`;
+}
+
+const VIEWS = { home: viewHome, activity: viewActivity, accounts: viewAccounts, categories: viewCategories, settings: viewSettings };
+const NAV = [['home', 'Home', '⌂'], ['activity', 'Activity', '☰'], ['accounts', 'Accounts', '◉'], ['settings', 'Settings', '⚙']];
+
+function renderLogin(message = '') {
+  app.innerHTML = `<div class="login"><h1>Peach</h1><p class="muted">Sign in to continue.</p>
+    <form id="login" class="stack">
+      <div class="field"><label for="em">Email</label><input id="em" type="email" name="email" autocomplete="username" required></div>
+      <div class="field"><label for="pw">Password</label><input id="pw" type="password" name="password" autocomplete="current-password" required></div>
+      <div class="err" role="alert">${esc(message)}</div>
+      <button class="primary" type="submit">Sign in</button></form></div>`;
+  document.getElementById('login').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = Object.fromEntries(new FormData(e.target));
+    const btn = e.target.querySelector('button'); btn.disabled = true;
+    const { error } = await sb.auth.signInWithPassword({ email: f.email.trim(), password: f.password });
+    if (error) renderLogin(error.message === 'Invalid login credentials' ? 'Email or password is not right.' : error.message);
+  });
+}
+
+function render() {
+  if (!state.session) return renderLogin();
+  if (state.loadError) {
+    app.innerHTML = `<div class="login"><h1>Could not load</h1><p class="err">${esc(state.loadError)}</p><button class="primary" data-act="retry">Try again</button></div>`;
+    return;
+  }
+  const view = VIEWS[state.view] ? state.view : 'home';
+  const navKey = view === 'categories' ? 'settings' : view;
+  app.innerHTML = `<div class="shell"><nav class="nav" aria-label="Main"><div class="brand">Peach</div>
+    ${NAV.map(([k, label, ico]) => `<a href="#${k}" ${k === navKey ? 'aria-current="page"' : ''}><span class="ico" aria-hidden="true">${ico}</span>${label}</a>`).join('')}</nav>
+    <main>${VIEWS[view]()}</main>
+    <button class="fab" data-act="quick-add" aria-label="Add: I got paid, I spent, or move money">＋</button></div>`;
+}
+
+// ---------- forms ----------
+function accountOptions(selectedId, { skipId = null, types = GROUP_ORDER } = {}) {
+  return GROUP_ORDER.filter((t) => types.includes(t)).map((t) => {
+    const list = activeAccounts().filter((a) => a.type === t && a.id !== skipId).sort(bySort);
+    return list.length ? `<optgroup label="${GROUP_LABELS[t]}">${list.map((a) => `<option value="${a.id}" ${a.id === selectedId ? 'selected' : ''}>${esc(a.name)}${a.last4 ? ` ••${esc(a.last4)}` : ''}</option>`).join('')}</optgroup>` : '';
+  }).join('');
+}
+function categoryOptions(selectedId) {
+  const ok = (c) => !c.archived_at && c.kind !== 'savings' && c.kind !== 'income';
+  const tops = state.categories.filter((c) => !c.parent_id && ok(c)).sort(bySort);
+  return tops.map((p) => {
+    const kids = state.categories.filter((c) => c.parent_id === p.id && ok(c)).sort(bySort);
+    return `<option value="${p.id}" ${p.id === selectedId ? 'selected' : ''}>${esc(p.name)}</option>${kids.map((k) => `<option value="${k.id}" ${k.id === selectedId ? 'selected' : ''}>${esc(p.name)} › ${esc(k.name)}</option>`).join('')}`;
+  }).join('');
+}
+function needAccounts() {
+  if (activeAccounts().length) return false;
+  toast('Add an account first (Accounts tab).', true);
+  location.hash = '#accounts';
+  return true;
+}
+
+function spentForm(t) {
+  const l = t ? state.lines.find((x) => x.transaction_id === t.id) : null;
+  const lastAcct = t?.account_id ?? lsGet('peach.lastAccount');
+  const lastCat = l?.category_id ?? lsGet('peach.lastCategory');
+  const work = l?.reimb_budget ?? '';
+  openForm({
+    title: t ? 'Edit purchase' : 'I spent', submitLabel: t ? 'Save' : 'Add',
+    body: `<div class="field"><label>Amount (CAD)</label><input name="amount" inputmode="decimal" placeholder="0.00" required autofocus value="${t ? centsToInput(-t.amount_cents) : ''}"></div>
+      <div class="field"><label>What was it? (optional)</label><input name="payee" value="${esc(t?.payee)}" placeholder="e.g. Loblaws"></div>
+      <div class="field"><label>Category</label><select name="category_id">${categoryOptions(lastCat)}</select></div>
+      <div class="field"><label>Paid with</label><select name="account_id">${accountOptions(lastAcct, { types: GROUP_ORDER })}</select></div>
+      <div class="field"><label>Date</label><input type="date" name="date" required value="${esc(t?.date ?? todayLocal())}"></div>
+      <div class="field"><label>Will work reimburse this?</label><select name="work">
+        <option value="" ${work === '' ? 'selected' : ''}>No</option>
+        <option value="communications" ${work === 'communications' ? 'selected' : ''}>Yes: Communications</option>
+        <option value="fuel" ${work === 'fuel' ? 'selected' : ''}>Yes: Car fuel</option></select>
+        <div class="small muted" style="margin-top:.3rem">Only the part under your limit is reimbursable. The rest stays your own cost.</div></div>`,
+    onSubmit: async (f) => {
+      const cents = positiveCents(f.amount, 'Amount');
+      checkDate(f.date);
+      if (!f.account_id) throw new Error('Choose an account');
+      const lineRow = { category_id: f.category_id || null, amount_cents: cents, reimb_budget: f.work || null, reimb_eligible: !!f.work };
+      const txnRow = { account_id: f.account_id, date: f.date, amount_cents: -cents, kind: 'expense', payee: (f.payee ?? '').trim() || null };
+      if (t) {
+        await must(sb.from('transactions').update(txnRow).eq('id', t.id));
+        await must(sb.from('transaction_lines').update(lineRow).eq('transaction_id', t.id));
+      } else {
+        const created = await must(sb.from('transactions').insert(txnRow).select().single());
+        try { await must(sb.from('transaction_lines').insert({ ...lineRow, transaction_id: created.id })); }
+        catch (e) { await sb.from('transactions').delete().eq('id', created.id); throw e; }
+      }
+      lsSet('peach.lastAccount', f.account_id); lsSet('peach.lastCategory', f.category_id);
+      await refresh(); toast(t ? 'Saved' : 'Added');
+    },
+  });
+}
+
+function paidForm() {
+  const today = todayLocal();
+  const allowance = allowanceOn(state.allowance.map((a) => ({ effectiveFrom: a.effective_from, cents: a.amount_cents })), today);
+  const dep = accountOptions(lsGet('peach.lastDeposit'), { types: ['chequing', 'savings', 'cash'] });
+  openForm({
+    title: 'I got paid', submitLabel: 'Record pay',
+    intro: 'Fill in what actually arrived. Leave a line at 0 if it did not.',
+    body: `<div class="field"><label>Date received</label><input type="date" name="date" required value="${today}"></div>
+      <div class="field"><label>Deposited into</label><select name="account_id">${dep}</select></div>
+      <div class="field"><label>Allowance</label><input name="allowance" inputmode="decimal" value="${allowance != null ? centsToInput(allowance) : '0.00'}">
+        <div class="small muted">This is your spending money for the month.</div></div>
+      <div class="field"><label>Rent funding</label><input name="rent" inputmode="decimal" value="${centsToInput(state.settings?.rent_funding_cents ?? 191800)}">
+        <div class="small muted">Held for rent. It will not show as spendable.</div></div>
+      <div class="field"><label>Expense reimbursement received</label><input name="reimb" inputmode="decimal" value="0.00">
+        <div class="small muted">Money back from work. Recorded as received, not as new spending money.</div></div>`,
+    onSubmit: async (f) => {
+      checkDate(f.date);
+      if (!f.account_id) throw new Error('Choose an account (add a chequing account first)');
+      const parts = [['allowance', f.allowance], ['rent_funding', f.rent], ['reimbursement', f.reimb]]
+        .map(([src, v]) => [src, toCents(v || '0')]);
+      if (parts.some(([, c]) => c < 0)) throw new Error('Amounts cannot be negative');
+      const rows = parts.filter(([, c]) => c > 0).map(([src, c]) => ({ account_id: f.account_id, date: f.date, amount_cents: c, kind: 'income', income_source: src }));
+      if (!rows.length) throw new Error('Enter at least one amount');
+      await must(sb.from('transactions').insert(rows));
+      lsSet('peach.lastDeposit', f.account_id);
+      await refresh(); toast('Pay recorded');
+    },
+  });
+}
+
+function transferForm() {
+  openForm({
+    title: 'Pay a card / move money', submitLabel: 'Record',
+    intro: 'Paying a card or moving money between your own accounts is a transfer. It is never counted as spending.',
+    body: `<div class="field"><label>From</label><select name="from">${accountOptions(lsGet('peach.lastFrom'), { types: ['chequing', 'savings', 'cash'] })}</select></div>
+      <div class="field"><label>To</label><select name="to">${accountOptions(null, { types: GROUP_ORDER })}</select></div>
+      <div class="field"><label>Amount (CAD)</label><input name="amount" inputmode="decimal" placeholder="0.00" required></div>
+      <div class="field"><label>Date</label><input type="date" name="date" required value="${todayLocal()}"></div>
+      <label class="check"><input type="checkbox" name="rent"> This payment settles my rent charge on the card</label>`,
+    onSubmit: async (f) => {
+      const cents = positiveCents(f.amount, 'Amount');
+      checkDate(f.date);
+      if (!f.from || !f.to) throw new Error('Choose both accounts');
+      if (f.from === f.to) throw new Error('Choose two different accounts');
+      if (f.rent && byId(state.accounts, f.to)?.type !== 'credit_card') throw new Error('Rent settlement applies to a payment into a credit card');
+      const gid = crypto.randomUUID();
+      await must(sb.from('transactions').insert([
+        { account_id: f.from, date: f.date, amount_cents: -cents, kind: 'transfer', transfer_group_id: gid, is_rent_settlement: !!f.rent },
+        { account_id: f.to, date: f.date, amount_cents: cents, kind: 'transfer', transfer_group_id: gid, is_rent_settlement: !!f.rent },
+      ]));
+      lsSet('peach.lastFrom', f.from);
+      await refresh(); toast('Recorded');
+    },
+  });
+}
+
+function quickAdd() {
+  if (needAccounts()) return;
+  const dlg = document.createElement('dialog');
+  dlg.innerHTML = `<div class="stack"><h2>What do you want to record?</h2>
+    <button class="big primary" data-go="paid"><span aria-hidden="true">＋</span> I got paid</button>
+    <button class="big" data-go="spent"><span aria-hidden="true">−</span> I spent</button>
+    <button class="big" data-go="transfer"><span aria-hidden="true">⇄</span> Pay a card / move money</button>
+    <button data-go="close">Cancel</button></div>`;
+  document.body.appendChild(dlg);
+  dlg.addEventListener('close', () => dlg.remove());
+  dlg.addEventListener('click', (e) => {
+    const g = e.target.closest('[data-go]')?.dataset.go;
+    if (!g) return;
+    dlg.close();
+    if (g === 'paid') paidForm(); else if (g === 'spent') spentForm(); else if (g === 'transfer') transferForm();
+  });
+  dlg.showModal();
+}
+
+function accountForm(a) {
+  const types = Object.entries(TYPES).map(([k, v]) => `<option value="${k}" ${a?.type === k ? 'selected' : ''}>${v}</option>`).join('');
+  const entered = a ? (a.type === 'credit_card' ? -a.opening_balance_cents : a.opening_balance_cents) : 0;
+  return `<div class="field"><label>Name</label><input name="name" required value="${esc(a?.name)}" placeholder="e.g. RBC Visa"></div>
+    <div class="grid2"><div class="field"><label>Type</label><select name="type">${types}</select></div>
+    <div class="field"><label>Nickname (optional)</label><input name="nickname" value="${esc(a?.nickname)}"></div></div>
+    <div class="grid2"><div class="field"><label>Last 4 digits (optional)</label><input name="last4" inputmode="numeric" maxlength="4" pattern="[0-9]{0,4}" value="${esc(a?.last4)}"></div>
+    <div class="field"><label>Opening date</label><input type="date" name="opening_date" required value="${esc(a?.opening_date ?? state.settings?.tracking_start ?? todayLocal())}"></div></div>
+    <div class="field"><label id="balLabel">Opening balance</label><input name="opening" inputmode="decimal" value="${centsToInput(entered)}"></div>
+    <div id="cardFields" class="stack" hidden>
+      <div class="grid2"><div class="field"><label>Payment due on day (1–28)</label><input type="number" name="due_day" min="1" max="28" value="${a?.due_day ?? ''}" placeholder="e.g. 15"></div>
+      <div class="field"><label>Minimum payment (CAD)</label><input name="min_payment" inputmode="decimal" value="${a?.min_payment_cents != null ? centsToInput(a.min_payment_cents) : ''}" placeholder="e.g. 35.00"></div></div>
+      <div class="field"><label>Remind me this many days before</label><input type="number" name="remind_days" min="0" max="30" value="${a?.remind_days ?? 3}"></div>
+      <div class="small muted">If your card is due on the 29th–31st, enter 28 to be safe. Update the minimum each month if it changes.</div></div>`;
+}
+function wireAccountForm(dlg) {
+  const sel = dlg.querySelector('[name=type]'), lab = dlg.querySelector('#balLabel'), cf = dlg.querySelector('#cardFields');
+  const upd = () => { const cc = sel.value === 'credit_card';
+    lab.textContent = cc ? 'Amount owed on this card at the opening date (positive number)' : 'Balance at the opening date'; cf.hidden = !cc; };
+  sel.addEventListener('change', upd); upd();
+}
+function accountRow(f) {
+  const name = f.name.trim();
+  if (!name) throw new Error('Name is required');
+  const last4 = (f.last4 ?? '').trim();
+  if (last4 && !/^\d{1,4}$/.test(last4)) throw new Error('Last digits: numbers only, up to 4. Never enter a full account number.');
+  let cents = toCents(f.opening || '0');
+  const cc = f.type === 'credit_card';
+  if (cc) cents = 0 - cents;
+  let due = null, min = null, remind = 3;
+  if (cc) {
+    if ((f.due_day ?? '') !== '') { due = parseInt(f.due_day, 10); if (!(due >= 1 && due <= 28)) throw new Error('Due day must be between 1 and 28'); }
+    if ((f.min_payment ?? '').trim() !== '') { min = toCents(f.min_payment); if (min < 0) throw new Error('Minimum payment cannot be negative'); }
+    if ((f.remind_days ?? '') !== '') { remind = parseInt(f.remind_days, 10); if (!(remind >= 0 && remind <= 30)) throw new Error('Reminder days must be 0 to 30'); }
+  }
+  return { name, nickname: (f.nickname ?? '').trim() || null, last4: last4 || null, type: f.type, opening_balance_cents: cents,
+    opening_date: f.opening_date, due_day: due, min_payment_cents: min, remind_days: remind };
+}
+
+// ---------- actions ----------
+const handlers = {
+  retry: () => refresh(),
+  'sign-out': async () => { await sb.auth.signOut(); },
+  'quick-add': quickAdd,
+  'add-paid': () => { if (!needAccounts()) paidForm(); },
+  'add-spent': () => { if (!needAccounts()) spentForm(); },
+  'add-transfer': () => { if (!needAccounts()) transferForm(); },
+  'edit-spent': ({ id }) => spentForm(byId(state.txns, id)),
+  'delete-txn': async ({ id, type }) => {
+    if (!confirm('Delete this entry? This cannot be undone.')) return;
+    try {
+      const t = byId(state.txns, id);
+      if (type === 'transfer' && t.transfer_group_id) await must(sb.from('transactions').delete().eq('transfer_group_id', t.transfer_group_id));
+      else await must(sb.from('transactions').delete().eq('id', id));
+      await refresh(); toast('Deleted');
+    } catch (e) { toast(e.message, true); }
+  },
+  month: ({ dir }) => { state.month = addMonthsKey(state.month ?? monthKey(todayLocal()), parseInt(dir, 10)); render(); },
+
+  'add-account': () => openForm({ title: 'Add account', body: accountForm(null), submitLabel: 'Add', onOpen: wireAccountForm,
+    onSubmit: async (f) => { await must(sb.from('accounts').insert({ ...accountRow(f), sort_order: nextSort(state.accounts) })); await refresh(); toast('Account added'); } }),
+  'edit-account': ({ id }) => { const a = byId(state.accounts, id); openForm({ title: 'Edit account', body: accountForm(a), onOpen: wireAccountForm,
+    onSubmit: async (f) => { await must(sb.from('accounts').update(accountRow(f)).eq('id', id)); await refresh(); toast('Saved'); } }); },
+  'archive-account': async ({ id }) => {
+    if (!confirm('Archive this account? Its history is kept and you can restore it any time.')) return;
+    try { await must(sb.from('accounts').update({ archived_at: new Date().toISOString() }).eq('id', id)); await refresh(); toast('Archived'); } catch (e) { toast(e.message, true); } },
+  'restore-account': async ({ id }) => { try { await must(sb.from('accounts').update({ archived_at: null }).eq('id', id)); await refresh(); } catch (e) { toast(e.message, true); } },
+  'move-account': async ({ id, dir }) => {
+    const a = byId(state.accounts, id);
+    try { await reorder('accounts', activeAccounts().filter((x) => x.type === a.type), id, dir); await refresh(); } catch (e) { toast(e.message, true); } },
+  'card-calendar': ({ id }) => {
+    const a = byId(state.accounts, id);
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
+    const ics = buildCardIcs({ id: a.id, name: a.name, dueDay: a.due_day, minPaymentCents: a.min_payment_cents, remindDays: a.remind_days }, todayLocal(), stamp);
+    const blob = new Blob([ics], { type: 'text/calendar' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob); link.download = `${a.name.replace(/[^\w-]+/g, '-')}-due.ics`;
+    document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(link.href), 2000);
+    toast('Open the downloaded file to add the repeating reminder to your calendar');
+  },
+
+  'add-category': ({ parent }) => {
+    const tops = state.categories.filter((c) => !c.parent_id && !c.archived_at);
+    openForm({ title: parent ? 'Add sub-category' : 'Add category', submitLabel: 'Add',
+      body: `<div class="field"><label>Name</label><input name="name" required></div>
+        <div class="field"><label>Parent</label><select name="parent_id"><option value="">None (top level)</option>${tops.map((t) => `<option value="${t.id}" ${t.id === parent ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select></div>
+        <div class="field"><label>Type (top level only)</label><select name="kind">${Object.entries(KINDS).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('')}</select></div>`,
+      onSubmit: async (f) => {
+        const name = f.name.trim(); if (!name) throw new Error('Name is required');
+        const parentRow = f.parent_id ? byId(state.categories, f.parent_id) : null;
+        const sibs = state.categories.filter((c) => (c.parent_id ?? null) === (f.parent_id || null));
+        await must(sb.from('categories').insert({ name, parent_id: f.parent_id || null, kind: parentRow ? parentRow.kind : f.kind, sort_order: nextSort(sibs) }));
+        await refresh(); toast('Category added'); } });
+  },
+  'edit-category': ({ id }) => { const c = byId(state.categories, id);
+    openForm({ title: 'Rename category', body: `<div class="field"><label>Name</label><input name="name" required value="${esc(c.name)}"></div>`,
+      onSubmit: async (f) => { const name = f.name.trim(); if (!name) throw new Error('Name is required');
+        await must(sb.from('categories').update({ name }).eq('id', id)); await refresh(); toast('Saved'); } }); },
+  'archive-category': async ({ id }) => {
+    const kids = state.categories.filter((c) => c.parent_id === id && !c.archived_at);
+    if (!confirm(`Archive this category${kids.length ? ` and its ${kids.length} sub-categories` : ''}? Past transactions keep it.`)) return;
+    try { const now = new Date().toISOString();
+      await must(sb.from('categories').update({ archived_at: now }).in('id', [id, ...kids.map((k) => k.id)])); await refresh(); toast('Archived'); } catch (e) { toast(e.message, true); } },
+  'restore-category': async ({ id }) => { try { await must(sb.from('categories').update({ archived_at: null }).eq('id', id)); await refresh(); } catch (e) { toast(e.message, true); } },
+  'move-category': async ({ id, dir }) => {
+    const c = byId(state.categories, id);
+    const sibs = state.categories.filter((x) => (x.parent_id ?? null) === (c.parent_id ?? null) && !x.archived_at);
+    try { await reorder('categories', sibs, id, dir); await refresh(); } catch (e) { toast(e.message, true); } },
+
+  'delete-allowance': async ({ id }) => {
+    if (state.allowance.length <= 1) return toast('Keep at least one allowance amount.', true);
+    if (!confirm('Delete this allowance entry? Chanda calculations for those months will use the previous amount.')) return;
+    try { await must(sb.from('allowance_schedule').delete().eq('id', id)); await refresh(); } catch (e) { toast(e.message, true); } },
+  export: async () => {
+    try {
+      const out = { exported_at: new Date().toISOString(), currency: 'CAD', note: 'Amounts are integer cents.' };
+      for (const t of TABLES) out[t] = await must(sb.from(t).select('*'));
+      const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = `peach-export-${todayLocal()}.json`;
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      toast('Export downloaded');
+    } catch (e) { toast(e.message, true); }
+  },
+};
+
+const forms = {
+  tracking: async (f) => { await must(sb.from('settings').update({ tracking_start: f.tracking_start, updated_at: new Date().toISOString() }).eq('user_id', state.session.user.id)); },
+  rentfunding: async (f) => {
+    const c = toCents(f.rent); if (c < 0) throw new Error('Amount cannot be negative');
+    await must(sb.from('settings').update({ rent_funding_cents: c, updated_at: new Date().toISOString() }).eq('user_id', state.session.user.id)); },
+  allowance: async (f) => {
+    const cents = toCents(f.amount); if (cents < 0) throw new Error('Amount cannot be negative');
+    await must(sb.from('allowance_schedule').upsert({ effective_from: f.effective_from, amount_cents: cents }, { onConflict: 'user_id,effective_from' })); },
+  rules: async (f, form) => {
+    const sd = parseInt(f.period_start_day, 10), pd = parseInt(f.reimbursement_pay_day, 10), wp = parseInt(f.warn_at_percent, 10);
+    if (!(sd >= 1 && sd <= 28 && pd >= 1 && pd <= 28 && wp >= 1 && wp <= 100)) throw new Error('Check the numbers: days 1–28, warning 1–100');
+    await must(sb.from('settings').update({ period_start_day: sd, reimbursement_pay_day: pd, warn_at_percent: wp,
+      carry_over_unused: form.elements.carry_over_unused.checked, updated_at: new Date().toISOString() }).eq('user_id', state.session.user.id)); },
+  caps: async (f) => {
+    const rows = ['communications', 'fuel'].map((k) => ({ budget_key: k, cap_cents: toCents(f[k]), effective_from: f.effective_from }));
+    if (rows.some((r) => r.cap_cents < 0)) throw new Error('Caps cannot be negative');
+    await must(sb.from('reimbursement_rules').upsert(rows, { onConflict: 'user_id,budget_key,effective_from' })); },
+};
+
+app.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-act]');
+  if (b && handlers[b.dataset.act]) handlers[b.dataset.act](b.dataset);
+});
+app.addEventListener('submit', async (e) => {
+  const name = e.target.dataset?.form;
+  if (!name || !forms[name]) return;
+  e.preventDefault();
+  const btn = e.target.querySelector('button[type=submit]'); btn.disabled = true;
+  try { await forms[name](Object.fromEntries(new FormData(e.target)), e.target); await refresh(); toast('Saved'); }
+  catch (ex) { toast(ex.message || String(ex), true); }
+  btn.disabled = false;
+});
+
+function route() { state.view = (location.hash || '#home').slice(1); render(); window.scrollTo(0, 0); }
+window.addEventListener('hashchange', route);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && state.session && !document.querySelector('dialog[open]')) refresh(); // pick up changes from other devices
+});
+
+(async function boot() {
+  const { data } = await sb.auth.getSession();
+  state.session = data.session;
+  sb.auth.onAuthStateChange((_evt, session) => {
+    const was = !!state.session;
+    state.session = session;
+    if (!!session !== was) { session ? (route(), refresh()) : render(); }
+  });
+  state.view = (location.hash || '#home').slice(1);
+  if (state.session) await refresh(); else render();
+})();
