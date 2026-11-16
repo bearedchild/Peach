@@ -16,7 +16,7 @@ const GROUP_ORDER = ['chequing', 'savings', 'credit_card', 'cash'];
 const GROUP_LABELS = { chequing: 'Chequing', savings: 'Savings', credit_card: 'Credit cards', cash: 'Cash' };
 const TYPES = { chequing: 'Chequing', savings: 'Savings', credit_card: 'Credit card', cash: 'Cash' };
 const KINDS = { expense: 'Expense', savings: 'Savings', rent: 'Rent (funded by rent funding)', chanda: 'Chanda' };
-const BUDGET_LABELS = { communications: 'Communications', fuel: 'Car fuel' };
+const BUDGET_LABELS = { communications: 'Communications', fuel: 'Car fuel', petty_cash: 'Petty cash' };
 const INCOME_LABELS = { allowance: 'Allowance', rent_funding: 'Rent funding', reimbursement: 'Reimbursement received', other: 'Other income' };
 const TABLES = ['settings', 'allowance_schedule', 'reimbursement_rules', 'accounts', 'categories', 'budget_plans', 'claims',
   'transactions', 'transaction_lines', 'recurring_templates', 'chanda_funds', 'chanda_cycle_setup', 'chanda_payments'];
@@ -139,7 +139,8 @@ function rulesFromState(today) {
   const cap = (k) => (state.rules.filter((r) => r.budget_key === k && r.effective_from <= today).sort((a, b) => b.effective_from.localeCompare(a.effective_from))[0]?.cap_cents
     ?? DEFAULT_RULES.budgets[k].capCents);
   return { startDay: s.period_start_day ?? 21, payDay: s.reimbursement_pay_day ?? 1, carryOverUnused: !!s.carry_over_unused,
-    budgets: { communications: { label: 'Communications', capCents: cap('communications') }, fuel: { label: 'Car fuel', capCents: cap('fuel') } } };
+    budgets: { communications: { label: 'Communications', capCents: cap('communications') }, fuel: { label: 'Car fuel', capCents: cap('fuel') },
+      petty_cash: { label: 'Petty cash', capCents: null } } };
 }
 function expenseLines() {
   const txById = new Map(state.txns.map((t) => [t.id, t]));
@@ -468,8 +469,9 @@ function spentForm(t) {
       <div class="field"><label>Will work reimburse this?</label><select name="work">
         <option value="" ${work === '' ? 'selected' : ''}>No</option>
         <option value="communications" ${work === 'communications' ? 'selected' : ''}>Yes: Communications</option>
-        <option value="fuel" ${work === 'fuel' ? 'selected' : ''}>Yes: Car fuel</option></select>
-        <div class="small muted" style="margin-top:.3rem">Only the part under your limit is reimbursable. The rest stays your own cost.</div></div>`,
+        <option value="fuel" ${work === 'fuel' ? 'selected' : ''}>Yes: Car fuel</option>
+        <option value="petty_cash" ${work === 'petty_cash' ? 'selected' : ''}>Yes: Petty cash (paid back in full)</option></select>
+        <div class="small muted" style="margin-top:.3rem">Communications and fuel only reimburse up to their limit; the rest stays your own cost. Petty cash has no limit, so none of it is your cost.</div></div>`,
     onSubmit: async (f) => {
       const cents = positiveCents(f.amount, 'Amount');
       checkDate(f.date);
