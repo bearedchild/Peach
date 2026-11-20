@@ -305,8 +305,8 @@ function viewAccounts() {
   const card = (a, i, list) => {
     const cc = a.type === 'credit_card';
     const bal = cc
-      ? (a.opening_balance_cents <= 0 ? `Owed at start: ${fmtCad(-a.opening_balance_cents)}` : `Credit at start: ${fmtCad(a.opening_balance_cents)}`)
-      : `Opening balance: ${fmtCad(a.opening_balance_cents)}`;
+      ? (a.opening_balance_cents <= 0 ? `Owed at start: <span class="amt-hl">${fmtCad(-a.opening_balance_cents)}</span>` : `Credit at start: <span class="amt-hl">${fmtCad(a.opening_balance_cents)}</span>`)
+      : `Opening balance: <span class="amt-hl">${fmtCad(a.opening_balance_cents)}</span>`;
     return `<div class="card ${a.archived_at ? 'archived' : ''}">
       <div class="row"><div><h3>${esc(a.name)}${a.nickname ? ` <span class="muted">· ${esc(a.nickname)}</span>` : ''}${a.last4 ? ` <span class="muted">••${esc(a.last4)}</span>` : ''}</h3>
       <div class="small muted">${TYPES[a.type]} · ${bal} on ${esc(a.opening_date)}</div>${dueText(a)}</div>

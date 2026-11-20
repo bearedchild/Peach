@@ -134,3 +134,5 @@ button.big span { font-size: 1.3rem; }
 @media (min-width: 900px) { .fab { bottom: 28px; right: 28px; } }
 dialog .big { margin-bottom: .1rem; }
 [hidden] { display: none !important; }
+
+.amt-hl { color: #8ecbff; font-weight: 700; font-variant-numeric: tabular-nums; }
