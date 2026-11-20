@@ -2,7 +2,7 @@ import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js
 import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
 import { toCents, fmtCad, sum } from './lib/money.js';
 import { todayLocal, formatRange, calendarMonthOf, monthKey, addMonthsKey, parseDate, nextDueDate } from './lib/dates.js';
-import { DEFAULT_FUNDS, allowanceOn } from './lib/chanda.js';
+import { CHANDA_DEFAULT_ITEMS, CHANDA_BASES, cycleFor, fundPlan, fundProgress, nextPaidCents, currentAllowance } from './lib/chanda.js';
 import { DEFAULT_RULES, summarizePeriod } from './lib/reimbursement.js';
 import { personalSpendByCategory, reimbursableByLine, categoryStatus, rentEarmark } from './lib/budget.js';
 import { accountBalances } from './lib/accounts.js';
@@ -19,10 +19,10 @@ const KINDS = { expense: 'Expense', savings: 'Savings', rent: 'Rent (funded by r
 const BUDGET_LABELS = { communications: 'Communications', fuel: 'Car fuel', petty_cash: 'Petty cash' };
 const INCOME_LABELS = { allowance: 'Allowance', rent_funding: 'Rent funding', reimbursement: 'Reimbursement received', other: 'Other income' };
 const TABLES = ['settings', 'allowance_schedule', 'reimbursement_rules', 'accounts', 'categories', 'budget_plans', 'claims',
-  'transactions', 'transaction_lines', 'recurring_templates', 'chanda_funds', 'chanda_cycle_setup', 'chanda_payments'];
+  'transactions', 'transaction_lines', 'recurring_templates', 'chanda_funds', 'chanda_cycle_setup', 'chanda_payments', 'chanda_progress'];
 
 const state = { session: null, view: 'home', month: null, accounts: [], categories: [], settings: null, allowance: [], rules: [],
-  txns: [], lines: [], loadError: null };
+  txns: [], lines: [], chandaFunds: [], chandaProgress: [], loadError: null };
 
 // ---------- helpers ----------
 const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
@@ -77,7 +77,7 @@ function openForm({ title, intro = '', body, submitLabel = 'Save', onSubmit, onO
 
 // ---------- data ----------
 async function loadAll() {
-  const [accounts, categories, settings, allowance, rules, txns, lines] = await Promise.all([
+  const [accounts, categories, settings, allowance, rules, txns, lines, chandaFunds, chandaProgress] = await Promise.all([
     must(sb.from('accounts').select('*').order('sort_order').order('name')),
     must(sb.from('categories').select('*').order('sort_order').order('name')),
     must(sb.from('settings').select('*').maybeSingle()),
@@ -85,9 +85,15 @@ async function loadAll() {
     must(sb.from('reimbursement_rules').select('*').order('effective_from', { ascending: false })),
     must(sb.from('transactions').select('*').order('date', { ascending: false }).order('created_at', { ascending: false })),
     must(sb.from('transaction_lines').select('*')),
+    must(sb.from('chanda_funds').select('*').order('sort_order').order('name')),
+    must(sb.from('chanda_progress').select('*')),
   ]);
-  Object.assign(state, { accounts, categories, settings, allowance, rules, txns, lines, loadError: null });
+  Object.assign(state, { accounts, categories, settings, allowance, rules, txns, lines, chandaFunds, chandaProgress, loadError: null });
 }
+
+const fundRow = (it, i = 0) => ({ name: it.name, kind: (it.basis === 'annual_fixed' || it.basis === 'any') ? 'annual' : 'percent', basis: it.basis,
+  percent_bps: it.percentBps ?? null, annual_cents: it.annualCents ?? null, frequency: it.frequency, cycle_start_month: it.cycleStartMonth,
+  optional: !!it.optional, sort_order: (i + 1) * 10 });
 
 // First-run defaults. Each table is seeded only if it is empty, so this is safe to retry.
 async function ensureSeed() {
@@ -98,7 +104,7 @@ async function ensureSeed() {
     const kinds = { Rent: 'rent', Chanda: 'chanda', 'General savings': 'savings' };
     const parents = await must(sb.from('categories').insert(top.map((name, i) => ({ name, kind: kinds[name] ?? 'expense', sort_order: (i + 1) * 10 }))).select());
     const chandaId = parents.find((p) => p.name === 'Chanda').id;
-    await must(sb.from('categories').insert(DEFAULT_FUNDS.map((f, i) => ({ name: f.name, parent_id: chandaId, kind: 'chanda', sort_order: (i + 1) * 10 }))));
+    await must(sb.from('categories').insert(CHANDA_DEFAULT_ITEMS.map((f, i) => ({ name: f.name, parent_id: chandaId, kind: 'chanda', sort_order: (i + 1) * 10 }))));
     changed = true;
   }
   if (!state.rules.length) {
@@ -109,11 +115,18 @@ async function ensureSeed() {
     await must(sb.from('allowance_schedule').insert({ effective_from: '2026-12-01', amount_cents: 60000 }));
     changed = true;
   }
-  const funds = await must(sb.from('chanda_funds').select('id').limit(1));
-  if (!funds.length) {
-    await must(sb.from('chanda_funds').insert(DEFAULT_FUNDS.map((f, i) => ({
-      name: f.name, kind: f.kind, percent_bps: f.percentBps ?? null, annual_cents: f.annualCents ?? null,
-      cycle_start_month: f.cycleStartMonth, sort_order: (i + 1) * 10 }))));
+  if (!state.chandaFunds.length) {
+    await must(sb.from('chanda_funds').insert(CHANDA_DEFAULT_ITEMS.map((f, i) => fundRow(f, i))));
+    changed = true;
+  } else if (!state.chandaFunds.some((f) => f.basis === 'any')) {   // add the Waqf-e-Jadid pledge item for existing users
+    const waqf = CHANDA_DEFAULT_ITEMS.find((f) => f.basis === 'any');
+    await must(sb.from('chanda_funds').insert(fundRow(waqf, state.chandaFunds.length)));
+    changed = true;
+  }
+  const chandaCat = state.categories.find((c) => c.kind === 'chanda' && !c.parent_id);
+  if (chandaCat && !state.categories.some((c) => c.parent_id === chandaCat.id && c.name === 'Waqf-e-Jadid')) {
+    const kids = state.categories.filter((c) => c.parent_id === chandaCat.id);
+    await must(sb.from('categories').insert({ name: 'Waqf-e-Jadid', parent_id: chandaCat.id, kind: 'chanda', sort_order: nextSort(kids) }));
     changed = true;
   }
   if (changed) await loadAll();
@@ -302,6 +315,18 @@ function viewAccounts() {
   const active = activeAccounts();
   const archived = state.accounts.filter((a) => a.archived_at);
   const groups = GROUP_ORDER.map((t) => [t, active.filter((a) => a.type === t).sort(bySort)]).filter(([, l]) => l.length);
+  const balById = Object.fromEntries(accountBalances(mapAccounts(), mapTxns(), { includeArchived: true }).map((b) => [b.id, b]));
+  const balanceBlock = (a) => {
+    const b = balById[a.id];
+    if (!b) return '';
+    let label = 'Balance', val = fmtCad(b.balanceCents);
+    if (a.type === 'credit_card') {
+      if (b.owedCents > 0) { label = 'Owed'; val = fmtCad(b.owedCents); }
+      else if (b.balanceCents > 0) { label = 'Credit'; val = fmtCad(b.balanceCents); }
+      else { label = 'Owed'; val = fmtCad(0); }
+    }
+    return `<div class="bal"><div class="small muted">${label} now</div><div class="bal-amt">${val}</div></div>`;
+  };
   const card = (a, i, list) => {
     const cc = a.type === 'credit_card';
     const bal = cc
@@ -310,7 +335,7 @@ function viewAccounts() {
     return `<div class="card ${a.archived_at ? 'archived' : ''}">
       <div class="row"><div><h3>${esc(a.name)}${a.nickname ? ` <span class="muted">· ${esc(a.nickname)}</span>` : ''}${a.last4 ? ` <span class="muted">••${esc(a.last4)}</span>` : ''}</h3>
       <div class="small muted">${TYPES[a.type]} · ${bal} on ${esc(a.opening_date)}</div>${dueText(a)}</div>
-      ${a.archived_at ? '<span class="badge">Archived</span>' : ''}</div>
+      <div class="bal-wrap">${a.archived_at ? '<span class="badge">Archived</span>' : ''}${balanceBlock(a)}</div></div>
       <div class="actions">
         <button class="small" data-act="edit-account" data-id="${a.id}">Edit</button>
         ${cc && a.due_day && !a.archived_at ? `<button class="small" data-act="card-calendar" data-id="${a.id}">Add to calendar</button>` : ''}
@@ -399,8 +424,118 @@ function viewSettings() {
       <div class="actions"><button data-act="sign-out">Sign out</button></div></div></div>`;
 }
 
-const VIEWS = { home: viewHome, activity: viewActivity, accounts: viewAccounts, categories: viewCategories, settings: viewSettings };
-const NAV = [['home', 'Home', '⌂'], ['activity', 'Activity', '☰'], ['accounts', 'Accounts', '◉'], ['settings', 'Settings', '⚙']];
+
+// ---------- Chanda page ----------
+function chandaData(today = todayLocal()) {
+  const sched = state.allowance.map((a) => ({ effectiveFrom: a.effective_from, cents: a.amount_cents }));
+  const allowance = currentAllowance(sched, today);
+  const monthNow = monthKey(today);
+  const items = state.chandaFunds.filter((f) => !f.archived_at).sort(bySort).map((f) => {
+    const cycle = cycleFor(today, f.cycle_start_month);
+    const row = state.chandaProgress.find((p) => p.fund_id === f.id && p.cycle_start === cycle.start) ?? null;
+    const base = { basis: f.basis, percentBps: f.percent_bps, annualCents: f.annual_cents };
+    const plan = fundPlan({ ...base, frequency: f.frequency, overrideCents: f.amount_override_cents }, allowance);
+    const calcM = fundPlan({ ...base, frequency: 'monthly', overrideCents: null }, allowance).calcPerPeriodCents;
+    const calcY = fundPlan({ ...base, frequency: 'yearly', overrideCents: null }, allowance).calcPerPeriodCents;
+    const monthsPaid = row?.months_paid ?? 0, paidCents = row?.paid_cents ?? 0;
+    return { fund: f, cycle, plan, calcM, calcY, monthsPaid, paidCents, prog: fundProgress(plan, { paidCents }, cycle.months, monthNow) };
+  });
+  return { allowance, items };
+}
+
+function convertAmountOnFreqChange(curCents, toFreq, calcM, calcY) {
+  if (toFreq === 'yearly') return curCents === calcM ? calcY : curCents * 12;
+  return curCents === calcY ? calcM : Math.round(curCents / 12);
+}
+
+function ruleText(f, allowance) {
+  const pct = (f.percent_bps ?? 0) / 100;
+  if (f.basis === 'monthly_percent') return `${pct}% of your ${fmtCad(allowance ?? 0)} monthly allowance, every month`;
+  if (f.basis === 'annual_percent') return `${pct}% of one month's allowance (${fmtCad(Math.round(((allowance ?? 0) * (f.percent_bps ?? 0)) / 10000))}), once a year`;
+  if (f.basis === 'annual_fixed') return `${fmtCad(f.annual_cents ?? 0)} per year`;
+  return 'Any amount you choose';
+}
+const PROG_LABELS = { complete: ['✓', 'Fully paid', 'ok'], partial: ['◐', 'In progress', 'warning'], none: ['○', 'Not started', 'none'], over: ['⚠', 'Paid more than the total', 'over'] };
+
+function chandaCard(it, allowance) {
+  const f = it.fund, p = it.prog, yearly = f.frequency === 'yearly';
+  const [icon, label, cls] = PROG_LABELS[p.state];
+  const pledgeUnset = f.basis === 'any' && it.plan.perPeriodCents === 0;
+  return `<form class="card chanda" data-form="chanda" data-fund="${f.id}" data-calc-m="${it.calcM}" data-calc-y="${it.calcY}">
+    <div class="row"><h3>${esc(f.name)}</h3>${f.optional ? '<span class="badge">Optional</span>' : ''}</div>
+    <div class="small muted">${esc(ruleText(f, allowance))}</div>
+    <div class="small muted">Current cycle: ${esc(it.cycle.label)}</div>
+    <div class="grid3" style="margin-top:.8rem">
+      <div class="field"><label>Pay</label><select name="frequency" data-freq>
+        <option value="monthly" ${yearly ? '' : 'selected'}>Monthly</option><option value="yearly" ${yearly ? 'selected' : ''}>Yearly</option></select></div>
+      <div class="field"><label>Amount <span data-unit>${yearly ? 'per year' : 'per month'}</span> (CAD)</label>
+        <input name="amount" inputmode="decimal" value="${centsToInput(it.plan.perPeriodCents)}" required></div>
+      <div class="field" data-for="monthly" ${yearly ? 'hidden' : ''}><label>Months paid (0–12)</label>
+        <input type="number" name="months" min="0" max="12" value="${it.monthsPaid}"></div>
+      <div class="field" data-for="yearly" ${yearly ? '' : 'hidden'}><label>Paid so far (CAD)</label>
+        <input name="paid" inputmode="decimal" value="${centsToInput(it.paidCents)}"></div></div>
+    ${pledgeUnset ? '<div class="small muted" style="margin-bottom:.5rem">Enter the amount you have pledged.</div>' : ''}
+    <div class="bar" role="img" aria-label="${p.percent}% paid"><div class="bar-fill ${cls}" style="width:${p.percent}%"></div></div>
+    <div class="small" style="margin-top:.4rem"><b class="prog ${cls}">${icon} ${label}</b>${p.state === 'over' ? ` (by ${fmtCad(p.overpaidCents)}; not carried into the next cycle)` : ''}</div>
+    <div class="chanda-nums">
+      <div><div class="small muted">Total this cycle</div><div class="amount">${fmtCad(p.totalCents)}</div></div>
+      <div><div class="small muted">Paid so far</div><div class="amount">${fmtCad(p.paidCents)}</div></div>
+      <div><div class="small muted">Left to pay</div><div class="amount">${fmtCad(p.remainingCents)}</div></div></div>
+    ${p.remainingCents > 0 && p.totalCents > 0 ? `<div class="small muted">Budgeting suggestion: about ${fmtCad(p.suggestedMonthlyCents)} a month for the ${p.monthsLeft} month${p.monthsLeft === 1 ? '' : 's'} left in this cycle. A suggestion, not a payment.</div>` : ''}
+    <div class="actions"><button class="primary" type="submit">Save</button>
+      <button type="button" class="small" data-act="chanda-edit" data-id="${f.id}">Edit rules</button>
+      <button type="button" class="small danger" data-act="chanda-archive" data-id="${f.id}">Archive</button></div></form>`;
+}
+
+function viewChanda() {
+  const d = chandaData();
+  const req = d.items.filter((i) => !i.fund.optional), opt = d.items.filter((i) => i.fund.optional);
+  const tot = (list, k) => sum(list.map((i) => i.prog[k]));
+  const archived = state.chandaFunds.filter((f) => f.archived_at);
+  return `<div class="wrap"><div class="page-head"><h1>Chanda</h1><button class="primary" data-act="chanda-add">+ Add item</button></div>
+    <div class="note">This page tracks what you have paid toward each item in its current cycle. To also take the money out of an account, add it with <b>I spent</b> under Chanda. Amounts follow your ${fmtCad(d.allowance ?? 0)} allowance; type a different amount any time.</div>
+    <div class="stats"><div class="stat"><div class="stat-label">Required items</div><div class="stat-value">${fmtCad(tot(req, 'remainingCents'))}</div>
+      <div class="small muted">left to pay · ${fmtCad(tot(req, 'paidCents'))} paid of ${fmtCad(tot(req, 'totalCents'))}</div></div>
+      ${opt.length ? `<div class="stat"><div class="stat-label">Optional items</div><div class="stat-value">${fmtCad(tot(opt, 'remainingCents'))}</div>
+      <div class="small muted">left to pay · ${fmtCad(tot(opt, 'paidCents'))} paid of ${fmtCad(tot(opt, 'totalCents'))}</div></div>` : ''}</div>
+    ${d.items.length ? d.items.map((i) => chandaCard(i, d.allowance)).join('') : '<p class="muted">No Chanda items yet.</p>'}
+    ${archived.length ? `<h2 class="group-h">Archived</h2>${archived.map((f) => `<div class="card archived"><div class="row"><h3>${esc(f.name)}</h3><button class="small" data-act="chanda-restore" data-id="${f.id}">Restore</button></div></div>`).join('')}` : ''}</div>`;
+}
+
+function chandaRulesForm(f) {
+  const months = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const basis = f?.basis ?? 'monthly_percent';
+  return `<div class="field"><label>Name</label><input name="name" required value="${esc(f?.name)}"></div>
+    <div class="field"><label>How the amount is worked out</label><select name="basis">${Object.entries(CHANDA_BASES).map(([k, v]) => `<option value="${k}" ${k === basis ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></div>
+    <div class="field" data-show="percent"><label>Percent (%)</label><input name="percent" inputmode="decimal" value="${f?.percent_bps != null ? f.percent_bps / 100 : ''}" placeholder="e.g. 10"></div>
+    <div class="field" data-show="fixed"><label>Amount per year (CAD)</label><input name="fixed" inputmode="decimal" value="${f?.annual_cents != null ? centsToInput(f.annual_cents) : ''}" placeholder="e.g. 48.00"></div>
+    <div class="field"><label>Cycle starts on the 1st of</label><select name="cycle">${months.map((m, i) => `<option value="${i + 1}" ${(f?.cycle_start_month ?? 7) === i + 1 ? 'selected' : ''}>${m}</option>`).join('')}</select></div>
+    <label class="check"><input type="checkbox" name="optional" ${f?.optional ? 'checked' : ''}> This item is optional</label>`;
+}
+function wireChandaRules(dlg) {
+  const sel = dlg.querySelector('[name=basis]');
+  const upd = () => { const b = sel.value;
+    dlg.querySelector('[data-show=percent]').hidden = !(b === 'monthly_percent' || b === 'annual_percent');
+    dlg.querySelector('[data-show=fixed]').hidden = b !== 'annual_fixed'; };
+  sel.addEventListener('change', upd); upd();
+}
+function chandaRulesRow(f) {
+  const name = f.name.trim(); if (!name) throw new Error('Name is required');
+  const row = { name, basis: f.basis, kind: (f.basis === 'annual_fixed' || f.basis === 'any') ? 'annual' : 'percent', percent_bps: null, annual_cents: null,
+    cycle_start_month: parseInt(f.cycle, 10), optional: !!f.optional };
+  if (f.basis === 'monthly_percent' || f.basis === 'annual_percent') {
+    const pct = parseFloat(f.percent);
+    if (!(pct >= 0 && pct <= 100)) throw new Error('Percent must be between 0 and 100');
+    row.percent_bps = Math.round(pct * 100);
+  } else if (f.basis === 'annual_fixed') {
+    row.annual_cents = toCents(f.fixed || '0');
+    if (row.annual_cents < 0) throw new Error('Amount cannot be negative');
+  }
+  return row;
+}
+
+const VIEWS = { home: viewHome, activity: viewActivity, accounts: viewAccounts, chanda: viewChanda, categories: viewCategories, settings: viewSettings };
+const NAV = [['home', 'Home', '⌂'], ['activity', 'Activity', '☰'], ['accounts', 'Accounts', '◉'], ['chanda', 'Chanda', '◈'], ['settings', 'Settings', '⚙']];
 
 function renderLogin(message = '') {
   app.innerHTML = `<div class="login"><h1>Peach</h1><p class="muted">Sign in to continue.</p>
@@ -494,7 +629,7 @@ function spentForm(t) {
 
 function paidForm() {
   const today = todayLocal();
-  const allowance = allowanceOn(state.allowance.map((a) => ({ effectiveFrom: a.effective_from, cents: a.amount_cents })), today);
+  const allowance = currentAllowance(state.allowance.map((a) => ({ effectiveFrom: a.effective_from, cents: a.amount_cents })), today);
   const dep = accountOptions(lsGet('peach.lastDeposit'), { types: ['chequing', 'savings', 'cash'] });
   openForm({
     title: 'I got paid', submitLabel: 'Record pay',
@@ -676,6 +811,18 @@ const handlers = {
     const sibs = state.categories.filter((x) => (x.parent_id ?? null) === (c.parent_id ?? null) && !x.archived_at);
     try { await reorder('categories', sibs, id, dir); await refresh(); } catch (e) { toast(e.message, true); } },
 
+  'chanda-add': () => openForm({ title: 'Add Chanda item', submitLabel: 'Add', body: chandaRulesForm(null), onOpen: wireChandaRules,
+    onSubmit: async (f) => {
+      const row = chandaRulesRow(f);
+      await must(sb.from('chanda_funds').insert({ ...row, frequency: row.basis === 'monthly_percent' ? 'monthly' : 'yearly', sort_order: nextSort(state.chandaFunds) }));
+      await refresh(); toast('Item added'); } }),
+  'chanda-edit': ({ id }) => { const fund = byId(state.chandaFunds, id);
+    openForm({ title: 'Edit rules', intro: 'Saving resets the amount to what these rules work out to.', body: chandaRulesForm(fund), onOpen: wireChandaRules,
+      onSubmit: async (f) => { await must(sb.from('chanda_funds').update({ ...chandaRulesRow(f), amount_override_cents: null }).eq('id', id)); await refresh(); toast('Saved'); } }); },
+  'chanda-archive': async ({ id }) => {
+    if (!confirm('Archive this item? Its paid history is kept and you can restore it.')) return;
+    try { await must(sb.from('chanda_funds').update({ archived_at: new Date().toISOString() }).eq('id', id)); await refresh(); toast('Archived'); } catch (e) { toast(e.message, true); } },
+  'chanda-restore': async ({ id }) => { try { await must(sb.from('chanda_funds').update({ archived_at: null }).eq('id', id)); await refresh(); } catch (e) { toast(e.message, true); } },
   'delete-allowance': async ({ id }) => {
     if (state.allowance.length <= 1) return toast('Keep at least one allowance amount.', true);
     if (!confirm('Delete this allowance entry? Chanda calculations for those months will use the previous amount.')) return;
@@ -694,6 +841,31 @@ const handlers = {
 };
 
 const forms = {
+  chanda: async (f, form) => {
+    const fund = byId(state.chandaFunds, form.dataset.fund);
+    const today = todayLocal();
+    const freq = f.frequency === 'yearly' ? 'yearly' : 'monthly';
+    const per = toCents(f.amount || '0');
+    if (per < 0) throw new Error('Amount cannot be negative');
+    const allowance = currentAllowance(state.allowance.map((a) => ({ effectiveFrom: a.effective_from, cents: a.amount_cents })), today);
+    const calc = fundPlan({ basis: fund.basis, percentBps: fund.percent_bps, annualCents: fund.annual_cents, frequency: freq, overrideCents: null }, allowance).calcPerPeriodCents;
+    const cycle = cycleFor(today, fund.cycle_start_month);
+    const row = state.chandaProgress.find((p) => p.fund_id === fund.id && p.cycle_start === cycle.start);
+    let months = row?.months_paid ?? 0, paid = row?.paid_cents ?? 0;
+    if (freq === 'monthly') {
+      const nm = parseInt(f.months || '0', 10);
+      if (!(nm >= 0 && nm <= 12)) throw new Error('Months paid must be 0 to 12');
+      paid = nextPaidCents({ oldMonths: months, oldPaidCents: paid, newMonths: nm, perPeriodCents: per });
+      months = nm;
+    } else {
+      paid = toCents(f.paid || '0');
+      if (paid < 0) throw new Error('Paid so far cannot be negative');
+    }
+    await must(sb.from('chanda_funds').update({ frequency: freq, amount_override_cents: per === calc ? null : per }).eq('id', fund.id));
+    const data = { months_paid: months, paid_cents: paid, updated_at: new Date().toISOString() };
+    if (row) await must(sb.from('chanda_progress').update(data).eq('id', row.id));
+    else await must(sb.from('chanda_progress').insert({ fund_id: fund.id, cycle_start: cycle.start, ...data }));
+  },
   tracking: async (f) => { await must(sb.from('settings').update({ tracking_start: f.tracking_start, updated_at: new Date().toISOString() }).eq('user_id', state.session.user.id)); },
   rentfunding: async (f) => {
     const c = toCents(f.rent); if (c < 0) throw new Error('Amount cannot be negative');
@@ -715,6 +887,15 @@ const forms = {
 app.addEventListener('click', (e) => {
   const b = e.target.closest('[data-act]');
   if (b && handlers[b.dataset.act]) handlers[b.dataset.act](b.dataset);
+});
+app.addEventListener('change', (e) => {
+  const sel = e.target.closest?.('[data-freq]');
+  if (!sel) return;
+  const form = sel.closest('form'), freq = sel.value;
+  form.querySelectorAll('[data-for]').forEach((el) => { el.hidden = el.dataset.for !== freq; });
+  const unit = form.querySelector('[data-unit]'); if (unit) unit.textContent = freq === 'yearly' ? 'per year' : 'per month';
+  const amt = form.querySelector('[name=amount]');
+  try { amt.value = centsToInput(convertAmountOnFreqChange(toCents(amt.value), freq, parseInt(form.dataset.calcM, 10), parseInt(form.dataset.calcY, 10))); } catch { /* leave what they typed */ }
 });
 app.addEventListener('submit', async (e) => {
   const name = e.target.dataset?.form;

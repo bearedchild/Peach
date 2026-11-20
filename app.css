@@ -136,3 +136,15 @@ dialog .big { margin-bottom: .1rem; }
 [hidden] { display: none !important; }
 
 .amt-hl { color: #8ecbff; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.bal-wrap { text-align: right; flex: none; }
+.bal-amt { font-size: 1.35rem; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); }
+
+/* ---------- Chanda page ---------- */
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: .75rem; }
+@media (max-width: 560px) { .grid3 { grid-template-columns: 1fr; } }
+.bar { height: 10px; border-radius: 99px; background: #1f1f22; overflow: hidden; border: 1px solid var(--line); }
+.bar-fill { height: 100%; background: var(--peach); }
+.bar-fill.ok { background: var(--good); } .bar-fill.over { background: var(--bad); }
+.prog.ok { color: var(--good); } .prog.warning { color: var(--warn); } .prog.over { color: var(--bad); }
+.chanda-nums { display: grid; grid-template-columns: repeat(3, 1fr); gap: .5rem; margin: .7rem 0 .4rem; }
